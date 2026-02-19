@@ -208,11 +208,16 @@ random.seed(orig_opt.seed)
 np.random.seed(orig_opt.seed)
 
 dynamics_class = getattr(dynamics, orig_opt.dynamics_class)
-dynamics = dynamics_class(**{argname: getattr(orig_opt, argname) for argname in inspect.signature(dynamics_class).parameters.keys() if argname != 'self'})
+dynamics_kwargs = {argname: getattr(orig_opt, argname) for argname in inspect.signature(dynamics_class).parameters.keys() if argname != 'self'}
+# In temporal_consistency mode, skip loading physical params from data_root (e.g. for quadrotor 2D)
+if orig_opt.dynamics_class == 'CartPole' and getattr(orig_opt, 'training_objective', 'hj_pde') == 'temporal_consistency':
+    if 'load_physics_from_data_root' in dynamics_kwargs:
+        dynamics_kwargs['load_physics_from_data_root'] = False
+dynamics = dynamics_class(**dynamics_kwargs)
 dynamics.deepreach_model=orig_opt.deepreach_model
-if getattr(orig_opt, "training_objective", "hj_pde") == "temporal_consistency" and orig_opt.dynamics_class != 'CartPole':
+if getattr(orig_opt, "training_objective", "hj_pde") == "temporal_consistency" and orig_opt.dynamics_class not in ('CartPole', 'Quadrotor2D', 'Quadrotor3D'):
     raise RuntimeError(
-        "training_objective=temporal_consistency is currently supported only for CartPole with trajectory-backed CartPoleDataset."
+        "training_objective=temporal_consistency is currently supported only for CartPole, Quadrotor2D, or Quadrotor3D with trajectory-backed CartPoleDataset."
     )
 if getattr(orig_opt, "training_objective", "hj_pde") == "temporal_consistency":
     if getattr(orig_opt, "tc_target_mode", "one_step") != "one_step":
@@ -231,9 +236,9 @@ if getattr(orig_opt, "training_objective", "hj_pde") == "temporal_consistency":
         warnings.warn(
             "--tc_sample_terminal is ignored for observed-flow temporal consistency."
         )
-if orig_opt.dynamics_class == 'CartPole':
+if orig_opt.dynamics_class in ('CartPole', 'Quadrotor2D', 'Quadrotor3D'):
     if orig_opt.data_root is None:
-        raise RuntimeError('CartPole requires --data_root for CartPoleDataset')
+        raise RuntimeError(f'{orig_opt.dynamics_class} requires --data_root for CartPoleDataset')
     dataset = dataio.CartPoleDataset(
         dynamics=dynamics, numpoints=orig_opt.numpoints,
         pretrain=orig_opt.pretrain, pretrain_iters=orig_opt.pretrain_iters,

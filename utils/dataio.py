@@ -179,9 +179,13 @@ class CartPoleDataset(Dataset):
         if not self.traj_files:
             raise RuntimeError(f"No trajectory files found in {traj_dir}")
         if self.max_trajectory_files > 0 and self.max_trajectory_files < len(self.traj_files):
-            perm = torch.randperm(len(self.traj_files))
-            keep = perm[:self.max_trajectory_files].tolist()
-            self.traj_files = [self.traj_files[i] for i in keep]
+            # When using shuffled indices, take first N (deterministic). Otherwise random sample.
+            if self.use_shuffled_indices_only:
+                self.traj_files = self.traj_files[: self.max_trajectory_files]
+            else:
+                perm = torch.randperm(len(self.traj_files))
+                keep = perm[:self.max_trajectory_files].tolist()
+                self.traj_files = [self.traj_files[i] for i in keep]
 
         self.traj_state_cache = None
         self.traj_lengths = None
