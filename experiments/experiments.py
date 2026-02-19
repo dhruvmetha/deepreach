@@ -152,28 +152,11 @@ class Experiment(ABC):
                     gt = {key: value.to(device) for key, value in gt.items()}
 
                     if temporal_mode:
-                        values_t0 = None
-                        t0_boundary = None
-                        if ('tc_t0_model_coords' in model_input) and ('tc_t0_boundary' in gt):
-                            t0_results = self.model({'coords': model_input['tc_t0_model_coords']})
-                            values_t0 = self.dataset.dynamics.io_to_value(
-                                t0_results['model_in'].detach(),
-                                t0_results['model_out'].squeeze(dim=-1),
-                            )
-                            t0_boundary = gt['tc_t0_boundary']
-
-                        # During pretrain: only need t0 for loss; skip interior forward to save compute
-                        if self.dataset.pretrain and values_t0 is not None:
-                            # Dummy interior values (only tc_anchor is used for train_loss)
-                            n_interior = model_input['tc_model_coords_curr'].shape[0]
-                            device = model_input['tc_model_coords_curr'].device
-                            values_curr = torch.zeros(n_interior, device=device, dtype=values_t0.dtype)
-                            dvdt_curr = torch.zeros(n_interior, device=device, dtype=values_t0.dtype)
-                            dvds_curr = torch.zeros(n_interior, model_input['tc_obs_flow'].shape[-1], device=device, dtype=values_t0.dtype)
-                            losses = loss_fn(
-                                values_curr, dvdt_curr, dvds_curr,
-                                model_input['tc_obs_flow'], values_t0, t0_boundary,
-                            )
+                        if self.dataset.pretrain:
+                            # Pretrain: push raw network output → 0 (matches HJ exact-model pretrain)
+                            pretrain_results = self.model({'coords': model_input['tc_model_coords_curr']})
+                            pretrain_output = pretrain_results['model_out'].squeeze(dim=-1)
+                            losses = {'pretrain': torch.abs(pretrain_output).sum()}
                         else:
                             curr_results = self.model({'coords': model_input['tc_model_coords_curr']})
                             values_curr = self.dataset.dynamics.io_to_value(
@@ -186,13 +169,13 @@ class Experiment(ABC):
                             )
                             dvdt_curr = dvs_curr[..., 0]
                             dvds_curr = dvs_curr[..., 1:]
+
                             losses = loss_fn(
                                 values_curr,
                                 dvdt_curr,
                                 dvds_curr,
                                 model_input['tc_obs_flow'],
-                                values_t0,
-                                t0_boundary,
+                                gt['tc_boundary_values'],
                             )
                     else:
                         model_results = self.model({'coords': model_input['model_coords']})
@@ -217,12 +200,12 @@ class Experiment(ABC):
                             raise NotImplementedError
 
                     if temporal_mode:
-                        # During pretrain: only optimize t0 boundary loss (like HJ PDE pretrain).
-                        # Requires tc_t0_mode != 'off'; otherwise pretrain has no effect.
-                        if self.dataset.pretrain and 'tc_anchor' in losses and losses['tc_anchor'].numel() > 0:
-                            train_loss = losses['tc_anchor'].mean()
+                        if 'pretrain' in losses:
+                            train_loss = losses['pretrain'].mean()
                         else:
-                            train_loss = losses['tc_total'].mean()
+                            train_loss = 0.
+                            for loss in losses.values():
+                                train_loss += loss.mean()
                     else:
                         train_loss = 0.
                         for loss in losses.values():
@@ -350,8 +333,6 @@ class Experiment(ABC):
                             }
                             if 'diff_constraint_hom' in losses:
                                 wandb_payload['pde_loss'] = losses['diff_constraint_hom']
-                            if 'tc_total' in losses:
-                                wandb_payload['tc_total'] = losses['tc_total']
                             wandb.log(wandb_payload)
 
                     total_steps += 1

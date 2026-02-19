@@ -57,6 +57,19 @@ def _load_bounds_from_dataset_description(data_root):
     return len(state_mean), state_mean, state_var
 
 
+def _max_abs_bound(achieved, key, fallback):
+    """From achieved_bounds dict, return max(|min|, |max|) for key, or fallback."""
+    entry = achieved.get(key, {})
+    if not isinstance(entry, dict):
+        return fallback
+    try:
+        min_val = float(entry.get("min"))
+        max_val = float(entry.get("max"))
+    except (TypeError, ValueError):
+        return fallback
+    return max(abs(min_val), abs(max_val))
+
+
 class Dynamics(ABC):
     def __init__(self, 
     loss_type:str, set_mode:str, 
@@ -1237,7 +1250,7 @@ class CartPole(Dynamics):
     ):
         desc = None
         desc_path = None
-        if data_root is not None and load_physics_from_data_root:
+        if data_root is not None:
             desc_path = os.path.join(data_root, "dataset_description.json")
             if os.path.exists(desc_path):
                 import json
@@ -1265,24 +1278,13 @@ class CartPole(Dynamics):
                     raise RuntimeError("Missing physical parameters in dataset_description.json")
 
         theta_bound = math.pi
-        if load_physics_from_data_root and isinstance(desc, dict):
+        if isinstance(desc, dict):
             achieved = desc.get("achieved_bounds", {})
             if isinstance(achieved, dict) and achieved:
-                def _max_abs_bound(key: str, fallback: float) -> float:
-                    entry = achieved.get(key, {})
-                    if not isinstance(entry, dict):
-                        return fallback
-                    try:
-                        min_val = float(entry.get("min"))
-                        max_val = float(entry.get("max"))
-                    except (TypeError, ValueError):
-                        return fallback
-                    return max(abs(min_val), abs(max_val))
-
-                x_bound = _max_abs_bound("x", x_bound)
-                theta_bound = _max_abs_bound("theta", theta_bound)
-                xdot_bound = _max_abs_bound("x_dot", xdot_bound)
-                thetadot_bound = _max_abs_bound("theta_dot", thetadot_bound)
+                x_bound = _max_abs_bound(achieved, "x", x_bound)
+                theta_bound = _max_abs_bound(achieved, "theta", theta_bound)
+                xdot_bound = _max_abs_bound(achieved, "x_dot", xdot_bound)
+                thetadot_bound = _max_abs_bound(achieved, "theta_dot", thetadot_bound)
 
         self.u_max = u_max
         self.g = gravity
@@ -1401,14 +1403,13 @@ class Quadrotor2D(Dynamics):
     """
     6D planar quadrotor state for temporal-consistency training with trajectory data.
     State: [x, z, theta, x_dot, z_dot, theta_dot]. Used when dataset has 6D state
-    (e.g. quadrotor2D_rl). Bounds can be loaded from dataset_description.json when
-    data_root is set and load_physics_from_data_root=True.
+    (e.g. quadrotor2D_rl). Bounds loaded from dataset_description.json achieved_bounds
+    using zero-centered max-abs-bound normalization (state_mean=0, state_var=max(|min|,|max|)).
     """
     def __init__(
         self,
         x_bound: float = 1.0,
-        z_bound: float = 0.7,
-        z_center: float = 0.8,
+        z_bound: float = 1.5,
         theta_bound: float = None,
         xdot_bound: float = 1.0,
         zdot_bound: float = 1.0,
@@ -1417,22 +1418,33 @@ class Quadrotor2D(Dynamics):
         data_root: str = None,
         load_physics_from_data_root: bool = True,
     ):
-        loaded = _load_bounds_from_dataset_description(data_root) if (data_root and load_physics_from_data_root) else None
-        if loaded is not None:
-            state_dim, state_mean, state_var = loaded
-            if state_dim != 6:
-                loaded = None
-        if loaded is None:
-            if theta_bound is None:
-                theta_bound = math.pi
-            state_mean = [0.0, z_center, 0.0, 0.0, 0.0, 0.0]
-            state_var = [x_bound, z_bound, theta_bound, xdot_bound, zdot_bound, thetadot_bound]
-            state_dim = 6
+        # Always read JSON for bounds when data_root is provided
+        desc = None
+        if data_root is not None:
+            desc_path = os.path.join(data_root, "dataset_description.json")
+            if os.path.exists(desc_path):
+                with open(desc_path, "r") as f:
+                    desc = json.load(f)
+
+        if theta_bound is None:
+            theta_bound = math.pi
+
+        # Load achieved bounds -> zero-centered max-abs-bound
+        if isinstance(desc, dict):
+            achieved = desc.get("achieved_bounds", {})
+            if isinstance(achieved, dict) and achieved:
+                x_bound = _max_abs_bound(achieved, "x", x_bound)
+                z_bound = _max_abs_bound(achieved, "z", z_bound)
+                theta_bound = _max_abs_bound(achieved, "theta", theta_bound)
+                xdot_bound = _max_abs_bound(achieved, "x_dot", xdot_bound)
+                zdot_bound = _max_abs_bound(achieved, "z_dot", zdot_bound)
+                thetadot_bound = _max_abs_bound(achieved, "theta_dot", thetadot_bound)
+
         super().__init__(
             loss_type='brt_hjivi', set_mode=set_mode,
-            state_dim=state_dim, input_dim=state_dim + 1, control_dim=0, disturbance_dim=0,
-            state_mean=state_mean,
-            state_var=state_var,
+            state_dim=6, input_dim=7, control_dim=0, disturbance_dim=0,
+            state_mean=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            state_var=[x_bound, z_bound, theta_bound, xdot_bound, zdot_bound, thetadot_bound],
             value_mean=0.0,
             value_var=1.0,
             value_normto=0.02,
@@ -1442,7 +1454,7 @@ class Quadrotor2D(Dynamics):
     def state_test_range(self):
         return [
             [-self.state_var[0], self.state_var[0]],
-            [self.state_mean[1] - self.state_var[1], self.state_mean[1] + self.state_var[1]],
+            [-self.state_var[1], self.state_var[1]],
             [-math.pi, math.pi],
             [-self.state_var[3], self.state_var[3]],
             [-self.state_var[4], self.state_var[4]],
@@ -1458,9 +1470,7 @@ class Quadrotor2D(Dynamics):
         raise NotImplementedError("Quadrotor2D is for temporal_consistency only; dsdt not used.")
 
     def boundary_fn(self, state):
-        scaled = (state - self.state_mean.to(device=state.device)) / (
-            self.state_var.to(device=state.device) + 1e-12
-        )
+        scaled = state / (self.state_var.to(device=state.device) + 1e-12)
         return torch.sqrt(torch.sum(scaled ** 2, dim=-1) + 1e-12) - 0.2
 
     def sample_target_state(self, num_samples):
@@ -1479,9 +1489,8 @@ class Quadrotor2D(Dynamics):
         return 0
 
     def plot_config(self):
-        z_center = self.state_mean[1].item() if hasattr(self.state_mean[1], 'item') else self.state_mean[1]
         return {
-            'state_slices': [0.0, z_center, 0.0, 0.0, 0.0, 0.0],
+            'state_slices': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             'state_labels': ['x', 'z', 'theta', 'x_dot', 'z_dot', 'theta_dot'],
             'x_axis_idx': 0,
             'y_axis_idx': 1,
@@ -1492,12 +1501,22 @@ class Quadrotor2D(Dynamics):
 class Quadrotor3D(Dynamics):
     """
     13D quadrotor state for temporal-consistency training with trajectory data.
-    State: [x, y, z, qw, qx, qy, qz, vx, vy, vz, wx, wy, wz]. Bounds can be loaded
-    from dataset_description.json when data_root is set and load_physics_from_data_root=True;
-    otherwise uses default 13D bounds (compatible with quadrotor3D_lqr).
+    State: [x, y, z, qw, qx, qy, qz, vx, vy, vz, wx, wy, wz]. Bounds loaded from
+    dataset_description.json achieved_bounds using zero-centered max-abs-bound
+    normalization (state_mean=0, state_var=max(|min|,|max|)).
     """
     # Default 13D state order for JSON achieved_bounds / initial_state_bounds
-    DEFAULT_STATE_ORDER = ["x", "y", "z", "qw", "qx", "qy", "qz", "vx", "vy", "vz", "wx", "wy", "wz"]
+    DEFAULT_STATE_ORDER = ["x", "y", "z", "qw", "qx", "qy", "qz",
+                           "vx", "vy", "vz", "wx", "wy", "wz"]
+    # Mapping from state_order keys to constructor param names
+    _BOUND_PARAM_MAP = {
+        "x": "x_bound", "y": "y_bound", "z": "z_bound",
+        "qw": "qw_bound", "qx": "qx_bound", "qy": "qy_bound", "qz": "qz_bound",
+        "vx": "vx_bound", "vy": "vy_bound", "vz": "vz_bound",
+        "x_dot": "vx_bound", "y_dot": "vy_bound", "z_dot": "vz_bound",
+        "wx": "wx_bound", "wy": "wy_bound", "wz": "wz_bound",
+        "p": "wx_bound", "q": "wy_bound", "r": "wz_bound",
+    }
 
     def __init__(
         self,
@@ -1519,24 +1538,53 @@ class Quadrotor3D(Dynamics):
         wy_bound: float = 10.0,
         wz_bound: float = 10.0,
     ):
-        loaded = _load_bounds_from_dataset_description(data_root) if (data_root and load_physics_from_data_root) else None
-        if loaded is not None:
-            state_dim, state_mean, state_var = loaded
-            if state_dim != 13:
-                loaded = None
-        if loaded is None:
-            state_dim = 13
-            state_mean = [0.0] * 13
-            state_var = [
-                x_bound, y_bound, z_bound,
-                qw_bound, qx_bound, qy_bound, qz_bound,
-                vx_bound, vy_bound, vz_bound,
-                wx_bound, wy_bound, wz_bound,
-            ]
+        # Always read JSON for bounds when data_root is provided
+        desc = None
+        if data_root is not None:
+            desc_path = os.path.join(data_root, "dataset_description.json")
+            if os.path.exists(desc_path):
+                with open(desc_path, "r") as f:
+                    desc = json.load(f)
+
+        # Collect bounds into a mutable dict for easy lookup
+        bounds_dict = {
+            "x_bound": x_bound, "y_bound": y_bound, "z_bound": z_bound,
+            "qw_bound": qw_bound, "qx_bound": qx_bound, "qy_bound": qy_bound, "qz_bound": qz_bound,
+            "vx_bound": vx_bound, "vy_bound": vy_bound, "vz_bound": vz_bound,
+            "wx_bound": wx_bound, "wy_bound": wy_bound, "wz_bound": wz_bound,
+        }
+
+        # Load achieved bounds -> zero-centered max-abs-bound
+        if isinstance(desc, dict):
+            achieved = desc.get("achieved_bounds", {})
+            if isinstance(achieved, dict) and achieved:
+                for key, param_name in self._BOUND_PARAM_MAP.items():
+                    if key in achieved:
+                        bounds_dict[param_name] = _max_abs_bound(achieved, key, bounds_dict[param_name])
+
+        # Read state_order from JSON to determine dimension ordering, fall back to DEFAULT
+        state_order = self.DEFAULT_STATE_ORDER
+        if isinstance(desc, dict):
+            traj = (desc.get("data_format") or {}).get("trajectory_files") or {}
+            json_order = traj.get("state_order")
+            if not json_order:
+                json_order = ((desc.get("generation_parameters") or {}).get("controller") or {}).get("goal_state_order")
+            if isinstance(json_order, (list, tuple)) and len(json_order) == 13:
+                state_order = list(json_order)
+
+        # Build state_var in state_order
+        state_var = []
+        for key in state_order:
+            param_name = self._BOUND_PARAM_MAP.get(key)
+            if param_name is not None:
+                state_var.append(bounds_dict[param_name])
+            else:
+                state_var.append(1.0)  # fallback for unknown keys
+
         super().__init__(
             loss_type='brt_hjivi', set_mode=set_mode,
-            state_dim=state_dim, input_dim=state_dim + 1, control_dim=0, disturbance_dim=0,
-            state_mean=state_mean,
+            state_dim=13, input_dim=14, control_dim=0, disturbance_dim=0,
+            state_mean=[0.0] * 13,
             state_var=state_var,
             value_mean=0.0,
             value_var=1.0,
@@ -1545,11 +1593,8 @@ class Quadrotor3D(Dynamics):
         )
 
     def state_test_range(self):
-        mean = self.state_mean
-        var = self.state_var
         return [
-            [(mean[i].item() if hasattr(mean[i], 'item') else mean[i]) - (var[i].item() if hasattr(var[i], 'item') else var[i]),
-             (mean[i].item() if hasattr(mean[i], 'item') else mean[i]) + (var[i].item() if hasattr(var[i], 'item') else var[i])]
+            [-self.state_var[i], self.state_var[i]]
             for i in range(self.state_dim)
         ]
 
@@ -1560,9 +1605,7 @@ class Quadrotor3D(Dynamics):
         raise NotImplementedError("Quadrotor3D is for temporal_consistency only; dsdt not used.")
 
     def boundary_fn(self, state):
-        scaled = (state - self.state_mean.to(device=state.device)) / (
-            self.state_var.to(device=state.device) + 1e-12
-        )
+        scaled = state / (self.state_var.to(device=state.device) + 1e-12)
         return torch.sqrt(torch.sum(scaled ** 2, dim=-1) + 1e-12) - 0.2
 
     def sample_target_state(self, num_samples):

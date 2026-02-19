@@ -57,7 +57,7 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--counter_end', type=int, default=-1, required=False, help='Defines the linear step for curriculum training starting from the initial time')
     p.add_argument('--num_src_samples', type=int, default=1000, required=False, help='Number of source samples (initial-time samples) at each time step')
     p.add_argument('--num_target_samples', type=int, default=0, required=False, help='Number of samples inside the target set')
-    p.add_argument('--dataset_class', type=str, default='ReachabilityDataset', choices=['ReachabilityDataset', 'CartPoleDataset'], help='Dataset class to use.')
+    p.add_argument('--dataset_class', type=str, default='ReachabilityDataset', choices=['ReachabilityDataset', 'CartPoleDataset', 'Quadrotor2DDataset', 'Quadrotor3DDataset'], help='Dataset class to use.')
     p.add_argument('--data_root', type=str, default=None, help='Root directory for datasets that load from files.')
     p.add_argument('--num_supervised', type=int, default=0, required=False, help='Number of supervised samples per batch (if supported).')
     p.add_argument('--supervised_value_safe', type=float, default=-1.0, required=False, help='Supervised target value for safe label.')
@@ -75,11 +75,8 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--training_objective', type=str, default='hj_pde', required=False, choices=['hj_pde', 'temporal_consistency'], help='Training objective: default HJ PDE residual, or observed-flow temporal PDE residual from trajectories.')
     p.add_argument('--tc_target_mode', type=str, default='one_step', required=False, choices=['one_step', 'n_step'], help='Legacy compatibility flag; ignored by observed-flow temporal consistency mode.')
     p.add_argument('--tc_n_step', type=int, default=1, required=False, help='Legacy compatibility flag; ignored by observed-flow temporal consistency mode.')
-    p.add_argument('--tc_loss_weight', type=float, default=1.0, required=False, help='Weight for temporal consistency flow-PDE loss.')
-    p.add_argument('--tc_anchor_weight', type=float, default=0.1, required=False, help='Weight for t=tMin boundary loss when --tc_t0_mode weighted.')
     p.add_argument('--tc_detach_next', default=True, type=bool, required=False, help='Legacy compatibility flag; ignored by observed-flow temporal consistency mode.')
     p.add_argument('--tc_sample_terminal', default=False, type=bool, required=False, help='Legacy compatibility flag; ignored by observed-flow temporal consistency mode.')
-    p.add_argument('--tc_t0_mode', type=str, default='weighted', required=False, choices=['weighted', 'fixed', 'off'], help='Boundary behavior at t=tMin for temporal consistency mode.')
 
     # model options
     p.add_argument('--model', type=str, default='sine', required=False, choices=['sine', 'tanh', 'sigmoid', 'relu'], help='Type of model to evaluate, default is sine.')
@@ -209,10 +206,6 @@ np.random.seed(orig_opt.seed)
 
 dynamics_class = getattr(dynamics, orig_opt.dynamics_class)
 dynamics_kwargs = {argname: getattr(orig_opt, argname) for argname in inspect.signature(dynamics_class).parameters.keys() if argname != 'self'}
-# In temporal_consistency mode, skip loading physical params from data_root (e.g. for quadrotor 2D)
-if orig_opt.dynamics_class == 'CartPole' and getattr(orig_opt, 'training_objective', 'hj_pde') == 'temporal_consistency':
-    if 'load_physics_from_data_root' in dynamics_kwargs:
-        dynamics_kwargs['load_physics_from_data_root'] = False
 dynamics = dynamics_class(**dynamics_kwargs)
 dynamics.deepreach_model=orig_opt.deepreach_model
 if getattr(orig_opt, "training_objective", "hj_pde") == "temporal_consistency" and orig_opt.dynamics_class not in ('CartPole', 'Quadrotor2D', 'Quadrotor3D'):
@@ -238,8 +231,8 @@ if getattr(orig_opt, "training_objective", "hj_pde") == "temporal_consistency":
         )
 if orig_opt.dynamics_class in ('CartPole', 'Quadrotor2D', 'Quadrotor3D'):
     if orig_opt.data_root is None:
-        raise RuntimeError(f'{orig_opt.dynamics_class} requires --data_root for CartPoleDataset')
-    dataset = dataio.CartPoleDataset(
+        raise RuntimeError(f'{orig_opt.dynamics_class} requires --data_root for trajectory dataset')
+    _dataset_kwargs = dict(
         dynamics=dynamics, numpoints=orig_opt.numpoints,
         pretrain=orig_opt.pretrain, pretrain_iters=orig_opt.pretrain_iters,
         tMin=orig_opt.tMin, tMax=orig_opt.tMax,
@@ -260,8 +253,13 @@ if orig_opt.dynamics_class in ('CartPole', 'Quadrotor2D', 'Quadrotor3D'):
         tc_target_mode=getattr(orig_opt, "tc_target_mode", "one_step"),
         tc_n_step=getattr(orig_opt, "tc_n_step", 4),
         tc_sample_terminal=getattr(orig_opt, "tc_sample_terminal", False),
-        tc_t0_mode=getattr(orig_opt, "tc_t0_mode", "weighted"),
     )
+    if orig_opt.dynamics_class == 'Quadrotor2D':
+        dataset = dataio.Quadrotor2DDataset(**_dataset_kwargs)
+    elif orig_opt.dynamics_class == 'Quadrotor3D':
+        dataset = dataio.Quadrotor3DDataset(**_dataset_kwargs)
+    else:
+        dataset = dataio.CartPoleDataset(**_dataset_kwargs)
 else:
     dataset = dataio.ReachabilityDataset(
         dynamics=dynamics, numpoints=orig_opt.numpoints, 
@@ -285,11 +283,7 @@ experiment.init_special(**{argname: getattr(orig_opt, argname) for argname in in
 if (mode == 'all') or (mode == 'train'):
     training_objective = getattr(orig_opt, "training_objective", "hj_pde")
     if training_objective == "temporal_consistency":
-        loss_fn = losses.init_temporal_consistency_loss(
-            tc_loss_weight=getattr(orig_opt, "tc_loss_weight", 1.0),
-            tc_anchor_weight=getattr(orig_opt, "tc_anchor_weight", 0.1),
-            tc_t0_mode=getattr(orig_opt, "tc_t0_mode", "weighted"),
-        )
+        loss_fn = losses.init_temporal_consistency_loss()
     elif training_objective == "hj_pde":
         if dynamics.loss_type == 'brt_hjivi':
             loss_fn = losses.init_brt_hjivi_loss(dynamics, orig_opt.minWith, orig_opt.dirichlet_loss_divisor)

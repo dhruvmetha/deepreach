@@ -62,7 +62,6 @@ def run_one_batch(
     device: str,
     training_objective: str,
     minWith: str,
-    tc_t0_mode: str,
     supervised_weight: float,
     supervised_safe_weight: float,
     supervised_unsafe_weight: float,
@@ -84,26 +83,17 @@ def run_one_batch(
         dvdt_curr = dvs_curr[..., 0]
         dvds_curr = dvs_curr[..., 1:]
         obs_flow = model_input["tc_obs_flow"]
+        boundary_values = gt["tc_boundary_values"]
         flow_dot = torch.sum(dvds_curr * obs_flow, dim=-1)
-        flow_residual = dvdt_curr + torch.minimum(torch.zeros_like(flow_dot), flow_dot)
-
-        values_t0 = None
-        t0_boundary = None
-        if ("tc_t0_model_coords" in model_input) and ("tc_t0_boundary" in gt):
-            t0_results = model({"coords": model_input["tc_t0_model_coords"]})
-            values_t0 = dynamics.io_to_value(
-                t0_results["model_in"].detach(),
-                t0_results["model_out"].squeeze(dim=-1),
-            )
-            t0_boundary = gt["tc_t0_boundary"]
+        diff_constraint_hom = dvdt_curr - flow_dot
+        flow_residual = torch.max(diff_constraint_hom, values_curr - boundary_values)
 
         loss_dict = loss_fn(
             values_curr,
             dvdt_curr,
             dvds_curr,
             obs_flow,
-            values_t0,
-            t0_boundary,
+            boundary_values,
         )
     else:
         # --- PDE batch (same as experiments/experiments.py) ---
@@ -180,11 +170,6 @@ def run_one_batch(
         print(_summarize("dvdt", dvdt_curr))
         print(_summarize("flow_dot", flow_dot))
         print(_summarize("flow_residual", flow_residual))
-        if tc_t0_mode != "off" and values_t0 is not None and t0_boundary is not None:
-            print(_summarize("v_t0", values_t0))
-            print(_summarize("t0_boundary", t0_boundary))
-        else:
-            print("t0 boundary mode: off")
     else:
         t = model_input["model_coords"][..., 0].detach().cpu()
         num_dir = int(torch.sum(dirichlet_masks).item())
@@ -226,9 +211,6 @@ def main():
     p.add_argument("--num_nl", type=int, default=128)
     p.add_argument("--tc_target_mode", choices=["one_step", "n_step"], default="one_step")
     p.add_argument("--tc_n_step", type=int, default=1)
-    p.add_argument("--tc_loss_weight", type=float, default=1.0)
-    p.add_argument("--tc_anchor_weight", type=float, default=0.1)
-    p.add_argument("--tc_t0_mode", choices=["weighted", "fixed", "off"], default="weighted")
     p.add_argument("--tc_detach_next", dest="tc_detach_next", action="store_true", help="Legacy compatibility flag; ignored in observed-flow temporal mode.")
     p.add_argument("--no_tc_detach_next", dest="tc_detach_next", action="store_false", help="Legacy compatibility flag; ignored in observed-flow temporal mode.")
     p.set_defaults(tc_detach_next=True)
@@ -282,6 +264,8 @@ def main():
     dynamics.deepreach_model = args.deepreach_model
 
     # Build dataset
+    # NOTE: For Quadrotor2D use dataio.Quadrotor2DDataset (angle_wrap_dims=[2]),
+    #       for Quadrotor3D use dataio.Quadrotor3DDataset (angle_wrap_dims=[]).
     dataset = dataio.CartPoleDataset(
         dynamics=dynamics,
         numpoints=args.numpoints,
@@ -306,7 +290,6 @@ def main():
         tc_target_mode=args.tc_target_mode,
         tc_n_step=args.tc_n_step,
         tc_sample_terminal=False,
-        tc_t0_mode=args.tc_t0_mode,
     )
 
     # Build model + loss
@@ -320,11 +303,7 @@ def main():
     ).to(args.device)
 
     if args.training_objective == "temporal_consistency":
-        loss_fn = losses.init_temporal_consistency_loss(
-            tc_loss_weight=args.tc_loss_weight,
-            tc_anchor_weight=args.tc_anchor_weight,
-            tc_t0_mode=args.tc_t0_mode,
-        )
+        loss_fn = losses.init_temporal_consistency_loss()
     else:
         loss_fn = losses.init_brt_hjivi_loss(dynamics, args.minWith, args.dirichlet_loss_divisor)
 
@@ -340,7 +319,6 @@ def main():
         device=args.device,
         training_objective=args.training_objective,
         minWith=args.minWith,
-        tc_t0_mode=args.tc_t0_mode,
         supervised_weight=args.supervised_weight,
         supervised_safe_weight=args.supervised_safe_weight,
         supervised_unsafe_weight=args.supervised_unsafe_weight,
@@ -358,7 +336,6 @@ def main():
         device=args.device,
         training_objective=args.training_objective,
         minWith=args.minWith,
-        tc_t0_mode=args.tc_t0_mode,
         supervised_weight=args.supervised_weight,
         supervised_safe_weight=args.supervised_safe_weight,
         supervised_unsafe_weight=args.supervised_unsafe_weight,
@@ -376,7 +353,6 @@ def main():
         device=args.device,
         training_objective=args.training_objective,
         minWith=args.minWith,
-        tc_t0_mode=args.tc_t0_mode,
         supervised_weight=args.supervised_weight,
         supervised_safe_weight=args.supervised_safe_weight,
         supervised_unsafe_weight=args.supervised_unsafe_weight,

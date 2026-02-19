@@ -118,7 +118,7 @@ class CartPoleDataset(Dataset):
         max_trajectory_files=0, use_shuffled_indices_only=False, shuffled_indices_file=None,
         load_trajectories_in_ram=False,
         training_objective='hj_pde', tc_target_mode='one_step', tc_n_step=4, tc_sample_terminal=False,
-        tc_t0_mode='weighted',
+        angle_wrap_dims=None,
     ):
         self.dynamics = dynamics
         self.numpoints = numpoints
@@ -150,7 +150,7 @@ class CartPoleDataset(Dataset):
         self.tc_target_mode = tc_target_mode
         self.tc_n_step = tc_n_step
         self.tc_sample_terminal = tc_sample_terminal
-        self.tc_t0_mode = tc_t0_mode
+        self.angle_wrap_dims = angle_wrap_dims if angle_wrap_dims is not None else [1]
         if self.training_objective not in ['hj_pde', 'temporal_consistency']:
             raise RuntimeError(
                 f"Unsupported training_objective={self.training_objective}. Expected 'hj_pde' or 'temporal_consistency'."
@@ -161,12 +161,8 @@ class CartPoleDataset(Dataset):
             )
         if self.tc_n_step < 1:
             raise RuntimeError("tc_n_step must be >= 1.")
-        if self.tc_t0_mode not in ['weighted', 'fixed', 'off']:
-            raise RuntimeError("tc_t0_mode must be one of: weighted, fixed, off.")
         if self.training_objective == 'temporal_consistency' and self.dt <= 0:
             raise RuntimeError("Temporal consistency mode requires dt > 0 to compute observed flow.")
-        if self.training_objective == 'temporal_consistency' and self.tc_t0_mode != 'off' and self.num_src_samples <= 0:
-            raise RuntimeError("Temporal consistency with tc_t0_mode!=off requires num_src_samples > 0.")
 
         traj_dir = os.path.join(self.data_root, "trajectories")
         self.traj_files = sorted(
@@ -225,18 +221,22 @@ class CartPoleDataset(Dataset):
             sup_path = roa_path if os.path.exists(roa_path) else (cal_path if os.path.exists(cal_path) else None)
 
         if sup_path is not None:
+            sd = self.dynamics.state_dim
             sup = torch.tensor(self._load_txt(sup_path), dtype=torch.float32)
             if sup.ndim == 1:
                 sup = sup[None, :]
-            if sup.shape[1] >= 9:
-                self.supervised_states = sup[:, :4]
+            if sup.shape[1] >= 2 * sd + 1:
+                # cal_set format: state, next_state, label
+                self.supervised_states = sup[:, :sd]
                 self.supervised_labels = sup[:, -1]
-            elif sup.shape[1] >= 5:
-                self.supervised_states = sup[:, :4]
-                self.supervised_labels = sup[:, 4]
+            elif sup.shape[1] >= sd + 1:
+                # roa_labels format: state, label
+                self.supervised_states = sup[:, :sd]
+                self.supervised_labels = sup[:, sd]
             else:
                 raise RuntimeError(
-                    f"Supervised label file {sup_path} has {sup.shape[1]} columns; expected 5 or 9."
+                    f"Supervised label file {sup_path} has {sup.shape[1]} columns; "
+                    f"expected at least {sd + 1} (state_dim={sd} + label)."
                 )
 
             safe_mask = self.supervised_labels > 0.5
@@ -303,6 +303,7 @@ class CartPoleDataset(Dataset):
         curr_coords_list = []
         obs_flow_list = []
         horizon_list = []
+        boundary_list = []
 
         remaining = self.numpoints
         no_progress_attempts = 0
@@ -319,6 +320,7 @@ class CartPoleDataset(Dataset):
             curr_coords_list.append(sampled['tc_model_coords_curr'])
             obs_flow_list.append(sampled['tc_obs_flow'])
             horizon_list.append(sampled['tc_horizon'])
+            boundary_list.append(sampled['tc_boundary_values'])
             remaining -= sampled_count
 
         if remaining > 0:
@@ -332,11 +334,8 @@ class CartPoleDataset(Dataset):
         }
         gt = {
             'tc_horizon': torch.cat(horizon_list, dim=0),
+            'tc_boundary_values': torch.cat(boundary_list, dim=0),
         }
-        if self.tc_t0_mode != 'off':
-            t0_model_coords, t0_boundary = self._sample_t0_boundary_batch()
-            model_input['tc_t0_model_coords'] = t0_model_coords
-            gt['tc_t0_boundary'] = t0_boundary
         return model_input, gt
 
     def _sample_transition_batch_once(self, batch_size):
@@ -348,6 +347,7 @@ class CartPoleDataset(Dataset):
         curr_model_coords = []
         obs_flow_values = []
         horizons = []
+        boundary_vals = []
 
         for f_idx, k in counts.items():
             states = self._load_states_by_file_index(f_idx)
@@ -360,13 +360,15 @@ class CartPoleDataset(Dataset):
             horizon = torch.ones_like(start_idx)
             curr_states = states[start_idx]
             next_states = states[next_idx]
+            boundary_vals.append(self.dynamics.boundary_fn(curr_states))
             curr_times = start_idx.float().unsqueeze(-1) * self.dt + self.tMin
 
             curr_coords = torch.cat((curr_times, curr_states), dim=-1)
             curr_model_coords.append(self._coord_to_model_input(curr_coords))
 
             state_delta = next_states - curr_states
-            state_delta[..., 1] = self._wrapped_angle_diff(next_states[..., 1], curr_states[..., 1])
+            for wrap_dim in self.angle_wrap_dims:
+                state_delta[..., wrap_dim] = self._wrapped_angle_diff(next_states[..., wrap_dim], curr_states[..., wrap_dim])
             obs_flow = state_delta / self.dt
             obs_flow_values.append(obs_flow)
             horizons.append(horizon)
@@ -378,43 +380,8 @@ class CartPoleDataset(Dataset):
             'tc_model_coords_curr': torch.cat(curr_model_coords, dim=0),
             'tc_obs_flow': torch.cat(obs_flow_values, dim=0),
             'tc_horizon': torch.cat(horizons, dim=0),
+            'tc_boundary_values': torch.cat(boundary_vals, dim=0),
         }
-
-    def _sample_t0_boundary_batch(self):
-        t0_coords_list = []
-        t0_boundary_list = []
-        remaining = self.num_src_samples
-        no_progress_attempts = 0
-        max_no_progress_attempts = 5
-        while remaining > 0 and no_progress_attempts < max_no_progress_attempts:
-            file_indices = self._sample_file_indices(remaining)
-            counts = {}
-            for file_idx in file_indices.tolist():
-                counts[file_idx] = counts.get(file_idx, 0) + 1
-
-            sampled_this_pass = 0
-            for f_idx, k in counts.items():
-                states = self._load_states_by_file_index(f_idx)
-                if states.shape[0] == 0:
-                    continue
-                start_states = states[0:1].repeat(k, 1)
-                start_times = torch.full((k, 1), self.tMin, dtype=start_states.dtype)
-                start_coords = torch.cat((start_times, start_states), dim=-1)
-                t0_coords_list.append(self._coord_to_model_input(start_coords))
-                t0_boundary_list.append(self.dynamics.boundary_fn(start_states))
-                sampled_this_pass += k
-
-            if sampled_this_pass == 0:
-                no_progress_attempts += 1
-                continue
-            remaining -= sampled_this_pass
-
-        if remaining > 0:
-            raise RuntimeError(
-                "No valid t0 boundary samples found; check trajectory files and num_src_samples."
-            )
-
-        return torch.cat(t0_coords_list, dim=0), torch.cat(t0_boundary_list, dim=0)
 
     def _wrapped_angle_diff(self, theta_next, theta_curr):
         return (theta_next - theta_curr + math.pi) % (2 * math.pi) - math.pi
@@ -615,3 +582,17 @@ class CartPoleDataset(Dataset):
             states = torch.tensor(self._load_txt(path), dtype=torch.float32)
             traj_state_cache.append(self._pad_states_to_tmax(states))
         return traj_state_cache
+
+
+class Quadrotor2DDataset(CartPoleDataset):
+    """CartPoleDataset with angle wrapping on dimension 2 (theta for 6D quadrotor)."""
+    def __init__(self, **kwargs):
+        kwargs.setdefault('angle_wrap_dims', [2])
+        super().__init__(**kwargs)
+
+
+class Quadrotor3DDataset(CartPoleDataset):
+    """CartPoleDataset with no angle wrapping (quaternion representation)."""
+    def __init__(self, **kwargs):
+        kwargs.setdefault('angle_wrap_dims', [])
+        super().__init__(**kwargs)
