@@ -133,3 +133,14 @@ wandb
 
 # experiment data
 runs
+
+# Venv pip/temp (avoids 2GB quota; under /common/users)
+.tmp
+.cache
+
+# User-specific exclusions
+datasets/
+deepreach/
+MEGA_NOTEBOOK.md
+TRAINING_SEQUENCE_NOTEBOOK.md
+cartpole_pybullet/

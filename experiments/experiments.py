@@ -94,6 +94,9 @@ class Experiment(ABC):
             loss_fn, clip_grad, use_lbfgs, adjust_relative_grads, 
             val_x_resolution, val_y_resolution, val_z_resolution, val_time_resolution,
             use_CSL, CSL_lr, CSL_dt, epochs_til_CSL, num_CSL_samples, CSL_loss_frac_cutoff, max_CSL_epochs, CSL_loss_weight, CSL_batch_size,
+            supervised_weight=0.0,
+            supervised_safe_weight=1.0,
+            supervised_unsafe_weight=1.0,
         ):
         was_eval = not self.model.training
         self.model.train()
@@ -122,9 +125,15 @@ class Experiment(ABC):
         writer = SummaryWriter(summaries_dir)
 
         total_steps = 0
-
-        if adjust_relative_grads:
-            new_weight = 1
+        new_weight = 1
+        training_objective = getattr(self.dataset, 'training_objective', 'hj_pde')
+        if training_objective not in ['hj_pde', 'temporal_consistency']:
+            raise RuntimeError(
+                f"Unsupported training objective: {training_objective}. Expected 'hj_pde' or 'temporal_consistency'."
+            )
+        temporal_mode = training_objective == 'temporal_consistency'
+        if temporal_mode and use_CSL:
+            raise RuntimeError("use_CSL is not supported with training_objective=temporal_consistency.")
 
         with tqdm(total=len(train_dataloader) * epochs) as pbar:
             train_losses = []
@@ -142,36 +151,97 @@ class Experiment(ABC):
                     model_input = {key: value.to(device) for key, value in model_input.items()}
                     gt = {key: value.to(device) for key, value in gt.items()}
 
-                    model_results = self.model({'coords': model_input['model_coords']})
+                    if temporal_mode:
+                        curr_results = self.model({'coords': model_input['tc_model_coords_curr']})
+                        values_curr = self.dataset.dynamics.io_to_value(
+                            curr_results['model_in'].detach(),
+                            curr_results['model_out'].squeeze(dim=-1),
+                        )
+                        dvs_curr = self.dataset.dynamics.io_to_dv(
+                            curr_results['model_in'],
+                            curr_results['model_out'].squeeze(dim=-1),
+                        )
+                        dvdt_curr = dvs_curr[..., 0]
+                        dvds_curr = dvs_curr[..., 1:]
 
-                    states = self.dataset.dynamics.input_to_coord(model_results['model_in'].detach())[..., 1:]
-                    values = self.dataset.dynamics.io_to_value(model_results['model_in'].detach(), model_results['model_out'].squeeze(dim=-1))
-                    dvs = self.dataset.dynamics.io_to_dv(model_results['model_in'], model_results['model_out'].squeeze(dim=-1))
-                    boundary_values = gt['boundary_values']
-                    if self.dataset.dynamics.loss_type == 'brat_hjivi':
-                        reach_values = gt['reach_values']
-                        avoid_values = gt['avoid_values']
-                    dirichlet_masks = gt['dirichlet_masks']
+                        values_t0 = None
+                        t0_boundary = None
+                        if ('tc_t0_model_coords' in model_input) and ('tc_t0_boundary' in gt):
+                            t0_results = self.model({'coords': model_input['tc_t0_model_coords']})
+                            values_t0 = self.dataset.dynamics.io_to_value(
+                                t0_results['model_in'].detach(),
+                                t0_results['model_out'].squeeze(dim=-1),
+                            )
+                            t0_boundary = gt['tc_t0_boundary']
 
-                    if self.dataset.dynamics.loss_type == 'brt_hjivi':
-                        losses = loss_fn(states, values, dvs[..., 0], dvs[..., 1:], boundary_values, dirichlet_masks, model_results['model_out'])
-                    elif self.dataset.dynamics.loss_type == 'brat_hjivi':
-                        losses = loss_fn(states, values, dvs[..., 0], dvs[..., 1:], boundary_values, reach_values, avoid_values, dirichlet_masks, model_results['model_out'])
+                        losses = loss_fn(
+                            values_curr,
+                            dvdt_curr,
+                            dvds_curr,
+                            model_input['tc_obs_flow'],
+                            values_t0,
+                            t0_boundary,
+                        )
                     else:
-                        raise NotImplementedError
-                    
+                        model_results = self.model({'coords': model_input['model_coords']})
+
+                        states = self.dataset.dynamics.input_to_coord(model_results['model_in'].detach())[..., 1:]
+                        values = self.dataset.dynamics.io_to_value(
+                            model_results['model_in'].detach(),
+                            model_results['model_out'].squeeze(dim=-1),
+                        )
+                        dvs = self.dataset.dynamics.io_to_dv(model_results['model_in'], model_results['model_out'].squeeze(dim=-1))
+                        boundary_values = gt['boundary_values']
+                        if self.dataset.dynamics.loss_type == 'brat_hjivi':
+                            reach_values = gt['reach_values']
+                            avoid_values = gt['avoid_values']
+                        dirichlet_masks = gt['dirichlet_masks']
+
+                        if self.dataset.dynamics.loss_type == 'brt_hjivi':
+                            losses = loss_fn(states, values, dvs[..., 0], dvs[..., 1:], boundary_values, dirichlet_masks, model_results['model_out'])
+                        elif self.dataset.dynamics.loss_type == 'brat_hjivi':
+                            losses = loss_fn(states, values, dvs[..., 0], dvs[..., 1:], boundary_values, reach_values, avoid_values, dirichlet_masks, model_results['model_out'])
+                        else:
+                            raise NotImplementedError
+
+                    if temporal_mode:
+                        train_loss = losses['tc_total'].mean()
+                    else:
+                        train_loss = 0.
+                        for loss in losses.values():
+                            train_loss += loss.mean()
+
+                    supervised_loss = None
+                    if supervised_weight > 0.0 and 'supervised_coords' in model_input and 'supervised_values' in gt:
+                        sup_results = self.model({'coords': model_input['supervised_coords']})
+                        sup_values = self.dataset.dynamics.io_to_value(
+                            sup_results['model_in'], sup_results['model_out'].squeeze(dim=-1)
+                        )
+                        sup_targets = gt['supervised_values']
+                        sup_errors = torch.pow(sup_values - sup_targets, 2)
+                        if 'supervised_labels' in gt:
+                            sup_labels = gt['supervised_labels']
+                            sample_weights = torch.where(
+                                sup_labels > 0.5,
+                                torch.full_like(sup_labels, supervised_safe_weight),
+                                torch.full_like(sup_labels, supervised_unsafe_weight),
+                            )
+                            supervised_loss = supervised_weight * torch.mean(sample_weights * sup_errors)
+                        else:
+                            supervised_loss = supervised_weight * torch.mean(sup_errors)
+
                     if use_lbfgs:
                         def closure():
                             optim.zero_grad()
-                            train_loss = 0.
-                            for loss_name, loss in losses.items():
-                                train_loss += loss.mean() 
-                            train_loss.backward()
-                            return train_loss
+                            closure_train_loss = train_loss
+                            if supervised_loss is not None:
+                                closure_train_loss += supervised_loss
+                            closure_train_loss.backward()
+                            return closure_train_loss
                         optim.step(closure)
 
                     # Adjust the relative magnitude of the losses if required
-                    if self.dataset.dynamics.deepreach_model in ['vanilla', 'diff'] and adjust_relative_grads:
+                    if (not temporal_mode) and self.dataset.dynamics.deepreach_model in ['vanilla', 'diff'] and adjust_relative_grads:
                         if losses['diff_constraint_hom'] > 0.01:
                             params = OrderedDict(self.model.named_parameters())
                             # Gradients with respect to the PDE loss
@@ -216,18 +286,21 @@ class Experiment(ABC):
                             new_weight = 0.9*new_weight + 0.1*num/den
                             losses['dirichlet'] = new_weight*losses['dirichlet']
                         writer.add_scalar('weight_scaling', new_weight, total_steps)
+                        train_loss = 0.
+                        for loss in losses.values():
+                            train_loss += loss.mean()
 
                     # import ipdb; ipdb.set_trace()
-
-                    train_loss = 0.
                     for loss_name, loss in losses.items():
                         single_loss = loss.mean()
 
-                        if loss_name == 'dirichlet':
+                        if loss_name == 'dirichlet' and (not temporal_mode):
                             writer.add_scalar(loss_name, single_loss/new_weight, total_steps)
                         else:
                             writer.add_scalar(loss_name, single_loss, total_steps)
-                        train_loss += single_loss
+                    if supervised_loss is not None:
+                        writer.add_scalar("supervised_loss", supervised_loss, total_steps)
+                        train_loss += supervised_loss
 
                     train_losses.append(train_loss.item())
                     writer.add_scalar("total_train_loss", train_loss, total_steps)
@@ -254,11 +327,15 @@ class Experiment(ABC):
                     if not total_steps % steps_til_summary:
                         tqdm.write("Epoch %d, Total loss %0.6f, iteration time %0.6f" % (epoch, train_loss, time.time() - start_time))
                         if self.use_wandb:
-                            wandb.log({
+                            wandb_payload = {
                                 'step': epoch,
                                 'train_loss': train_loss,
-                                'pde_loss': losses['diff_constraint_hom'],
-                            })
+                            }
+                            if 'diff_constraint_hom' in losses:
+                                wandb_payload['pde_loss'] = losses['diff_constraint_hom']
+                            if 'tc_total' in losses:
+                                wandb_payload['tc_total'] = losses['tc_total']
+                            wandb.log(wandb_payload)
 
                     total_steps += 1
 

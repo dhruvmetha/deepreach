@@ -2,6 +2,9 @@ import wandb
 import configargparse
 import inspect
 import os
+import shlex
+import sys
+import warnings
 import torch
 import shutil
 import random
@@ -54,6 +57,29 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--counter_end', type=int, default=-1, required=False, help='Defines the linear step for curriculum training starting from the initial time')
     p.add_argument('--num_src_samples', type=int, default=1000, required=False, help='Number of source samples (initial-time samples) at each time step')
     p.add_argument('--num_target_samples', type=int, default=0, required=False, help='Number of samples inside the target set')
+    p.add_argument('--dataset_class', type=str, default='ReachabilityDataset', choices=['ReachabilityDataset', 'CartPoleDataset'], help='Dataset class to use.')
+    p.add_argument('--data_root', type=str, default=None, help='Root directory for datasets that load from files.')
+    p.add_argument('--num_supervised', type=int, default=0, required=False, help='Number of supervised samples per batch (if supported).')
+    p.add_argument('--supervised_value_safe', type=float, default=-1.0, required=False, help='Supervised target value for safe label.')
+    p.add_argument('--supervised_value_unsafe', type=float, default=1.0, required=False, help='Supervised target value for unsafe label.')
+    p.add_argument('--supervised_weight', type=float, default=0.0, required=False, help='Weight for supervised value loss.')
+    p.add_argument('--supervised_labels_file', type=str, default=None, required=False, help='Optional supervised label filename/path (e.g., roa_labels.txt or cal_set.txt). If relative, resolved under --data_root.')
+    p.add_argument('--supervised_balanced_sampling', action='store_true', default=False, required=False, help='Sample supervised safe/unsafe states with an approximately balanced ratio each batch.')
+    p.add_argument('--supervised_safe_weight', type=float, default=1.0, required=False, help='Per-sample supervised MSE weight for safe labels.')
+    p.add_argument('--supervised_unsafe_weight', type=float, default=1.0, required=False, help='Per-sample supervised MSE weight for unsafe labels.')
+    p.add_argument('--trajectory_uniform_sampling', action='store_true', default=False, required=False, help='For CartPoleDataset, sample trajectories proportional to trajectory length so sampled states are approximately uniform over stored trajectory points.')
+    p.add_argument('--max_trajectory_files', type=int, default=0, required=False, help='For CartPoleDataset, limit training to this many trajectory files (0 means use all).')
+    p.add_argument('--use_shuffled_indices_only', action='store_true', default=False, required=False, help='For CartPoleDataset, only use trajectories listed in shuffled_indices.txt (training split).')
+    p.add_argument('--shuffled_indices_file', type=str, default=None, required=False, help='Optional shuffled index file path/name. If relative, resolved under --data_root.')
+    p.add_argument('--load_trajectories_in_ram', action='store_true', default=False, required=False, help='For CartPoleDataset, preload selected trajectory files into RAM to reduce per-epoch file I/O.')
+    p.add_argument('--training_objective', type=str, default='hj_pde', required=False, choices=['hj_pde', 'temporal_consistency'], help='Training objective: default HJ PDE residual, or observed-flow temporal PDE residual from trajectories.')
+    p.add_argument('--tc_target_mode', type=str, default='one_step', required=False, choices=['one_step', 'n_step'], help='Legacy compatibility flag; ignored by observed-flow temporal consistency mode.')
+    p.add_argument('--tc_n_step', type=int, default=1, required=False, help='Legacy compatibility flag; ignored by observed-flow temporal consistency mode.')
+    p.add_argument('--tc_loss_weight', type=float, default=1.0, required=False, help='Weight for temporal consistency flow-PDE loss.')
+    p.add_argument('--tc_anchor_weight', type=float, default=0.1, required=False, help='Weight for t=tMin boundary loss when --tc_t0_mode weighted.')
+    p.add_argument('--tc_detach_next', default=True, type=bool, required=False, help='Legacy compatibility flag; ignored by observed-flow temporal consistency mode.')
+    p.add_argument('--tc_sample_terminal', default=False, type=bool, required=False, help='Legacy compatibility flag; ignored by observed-flow temporal consistency mode.')
+    p.add_argument('--tc_t0_mode', type=str, default='weighted', required=False, choices=['weighted', 'fixed', 'off'], help='Boundary behavior at t=tMin for temporal consistency mode.')
 
     # model options
     p.add_argument('--model', type=str, default='sine', required=False, choices=['sine', 'tanh', 'sigmoid', 'relu'], help='Type of model to evaluate, default is sine.')
@@ -100,10 +126,15 @@ if (mode == 'all') or (mode == 'train'):
     dynamics_class = dynamics_classes_dict[p.parse_known_args()[0].dynamics_class]
     dynamics_params = {name: param for name, param in inspect.signature(dynamics_class).parameters.items() if name != 'self'}
     for param in dynamics_params.keys():
-        if dynamics_params[param].annotation is bool:
-            p.add_argument('--' + param, type=dynamics_params[param].annotation, default=False, help='special dynamics_class argument')
+        if ('--' + param) in p._option_string_actions:
+            continue
+        param_info = dynamics_params[param]
+        required = (param_info.default is inspect._empty)
+        default_val = None if required else param_info.default
+        if param_info.annotation is bool:
+            p.add_argument('--' + param, type=param_info.annotation, default=(False if required else default_val), help='special dynamics_class argument')
         else:
-            p.add_argument('--' + param, type=dynamics_params[param].annotation, required=True, help='special dynamics_class argument')
+            p.add_argument('--' + param, type=param_info.annotation, required=required, default=default_val, help='special dynamics_class argument')
 
 if (mode == 'all') or (mode == 'test'):
     p.add_argument('--dt', type=float, default=0.0025, help='The dt used in testing simulations')
@@ -141,6 +172,18 @@ elif mode == 'test':
         raise RuntimeError('Cannot run test mode: experiment directory not found!')
 
 current_time = datetime.now()
+# log command invocation
+invoked_command = "python " + " ".join(shlex.quote(arg) for arg in sys.argv)
+with open(os.path.join(experiment_dir, 'run_command.txt'), 'w') as f:
+    f.write(invoked_command + '\n')
+with open(os.path.join(experiment_dir, 'run_command.sh'), 'w') as f:
+    f.write('#!/usr/bin/env bash\n')
+    f.write(invoked_command + '\n')
+try:
+    os.chmod(os.path.join(experiment_dir, 'run_command.sh'), 0o750)
+except OSError:
+    pass
+
 # log current config
 with open(os.path.join(experiment_dir, 'config_%s.txt' % current_time.strftime('%m_%d_%Y_%H_%M')), 'w') as f:
     for arg, val in vars(opt).items():
@@ -167,12 +210,64 @@ np.random.seed(orig_opt.seed)
 dynamics_class = getattr(dynamics, orig_opt.dynamics_class)
 dynamics = dynamics_class(**{argname: getattr(orig_opt, argname) for argname in inspect.signature(dynamics_class).parameters.keys() if argname != 'self'})
 dynamics.deepreach_model=orig_opt.deepreach_model
-dataset = dataio.ReachabilityDataset(
-    dynamics=dynamics, numpoints=orig_opt.numpoints, 
-    pretrain=orig_opt.pretrain, pretrain_iters=orig_opt.pretrain_iters, 
-    tMin=orig_opt.tMin, tMax=orig_opt.tMax, 
-    counter_start=orig_opt.counter_start, counter_end=orig_opt.counter_end, 
-    num_src_samples=orig_opt.num_src_samples, num_target_samples=orig_opt.num_target_samples)
+if getattr(orig_opt, "training_objective", "hj_pde") == "temporal_consistency" and orig_opt.dynamics_class != 'CartPole':
+    raise RuntimeError(
+        "training_objective=temporal_consistency is currently supported only for CartPole with trajectory-backed CartPoleDataset."
+    )
+if getattr(orig_opt, "training_objective", "hj_pde") == "temporal_consistency":
+    if getattr(orig_opt, "tc_target_mode", "one_step") != "one_step":
+        warnings.warn(
+            "--tc_target_mode is ignored for observed-flow temporal consistency; one-step transitions are always used."
+        )
+    if getattr(orig_opt, "tc_n_step", 4) != 1:
+        warnings.warn(
+            "--tc_n_step is ignored for observed-flow temporal consistency; one-step transitions are always used."
+        )
+    if getattr(orig_opt, "tc_detach_next", True) is not True:
+        warnings.warn(
+            "--tc_detach_next is ignored for observed-flow temporal consistency."
+        )
+    if getattr(orig_opt, "tc_sample_terminal", False):
+        warnings.warn(
+            "--tc_sample_terminal is ignored for observed-flow temporal consistency."
+        )
+if orig_opt.dynamics_class == 'CartPole':
+    if orig_opt.data_root is None:
+        raise RuntimeError('CartPole requires --data_root for CartPoleDataset')
+    dataset = dataio.CartPoleDataset(
+        dynamics=dynamics, numpoints=orig_opt.numpoints,
+        pretrain=orig_opt.pretrain, pretrain_iters=orig_opt.pretrain_iters,
+        tMin=orig_opt.tMin, tMax=orig_opt.tMax,
+        counter_start=orig_opt.counter_start, counter_end=orig_opt.counter_end,
+        num_src_samples=orig_opt.num_src_samples, num_target_samples=orig_opt.num_target_samples,
+        data_root=orig_opt.data_root,
+        num_supervised=orig_opt.num_supervised,
+        supervised_value_safe=orig_opt.supervised_value_safe,
+        supervised_value_unsafe=orig_opt.supervised_value_unsafe,
+        supervised_labels_file=getattr(orig_opt, "supervised_labels_file", None),
+        supervised_balanced_sampling=getattr(orig_opt, "supervised_balanced_sampling", False),
+        trajectory_uniform_sampling=getattr(orig_opt, "trajectory_uniform_sampling", False),
+        max_trajectory_files=getattr(orig_opt, "max_trajectory_files", 0),
+        use_shuffled_indices_only=getattr(orig_opt, "use_shuffled_indices_only", False),
+        shuffled_indices_file=getattr(orig_opt, "shuffled_indices_file", None),
+        load_trajectories_in_ram=getattr(orig_opt, "load_trajectories_in_ram", False),
+        training_objective=getattr(orig_opt, "training_objective", "hj_pde"),
+        tc_target_mode=getattr(orig_opt, "tc_target_mode", "one_step"),
+        tc_n_step=getattr(orig_opt, "tc_n_step", 4),
+        tc_sample_terminal=getattr(orig_opt, "tc_sample_terminal", False),
+        tc_t0_mode=getattr(orig_opt, "tc_t0_mode", "weighted"),
+    )
+else:
+    dataset = dataio.ReachabilityDataset(
+        dynamics=dynamics, numpoints=orig_opt.numpoints, 
+        pretrain=orig_opt.pretrain, pretrain_iters=orig_opt.pretrain_iters, 
+        tMin=orig_opt.tMin, tMax=orig_opt.tMax, 
+        counter_start=orig_opt.counter_start, counter_end=orig_opt.counter_end, 
+        num_src_samples=orig_opt.num_src_samples, num_target_samples=orig_opt.num_target_samples)
+    if getattr(orig_opt, "training_objective", "hj_pde") == "temporal_consistency":
+        raise RuntimeError(
+            "training_objective=temporal_consistency requires trajectory-backed CartPoleDataset; ReachabilityDataset is not supported."
+        )
 
 model = modules.SingleBVPNet(in_features=dynamics.input_dim, out_features=1, type=orig_opt.model, mode=orig_opt.model_mode,
                              final_layer_factor=1., hidden_features=orig_opt.num_nl, num_hidden_layers=orig_opt.num_hl)
@@ -183,18 +278,32 @@ experiment = experiment_class(model=model, dataset=dataset, experiment_dir=exper
 experiment.init_special(**{argname: getattr(orig_opt, argname) for argname in inspect.signature(experiment_class.init_special).parameters.keys() if argname != 'self'})
 
 if (mode == 'all') or (mode == 'train'):
-    if dynamics.loss_type == 'brt_hjivi':
-        loss_fn = losses.init_brt_hjivi_loss(dynamics, orig_opt.minWith, orig_opt.dirichlet_loss_divisor)
-    elif dynamics.loss_type == 'brat_hjivi':
-        loss_fn = losses.init_brat_hjivi_loss(dynamics, orig_opt.minWith, orig_opt.dirichlet_loss_divisor)
+    training_objective = getattr(orig_opt, "training_objective", "hj_pde")
+    if training_objective == "temporal_consistency":
+        loss_fn = losses.init_temporal_consistency_loss(
+            tc_loss_weight=getattr(orig_opt, "tc_loss_weight", 1.0),
+            tc_anchor_weight=getattr(orig_opt, "tc_anchor_weight", 0.1),
+            tc_t0_mode=getattr(orig_opt, "tc_t0_mode", "weighted"),
+        )
+    elif training_objective == "hj_pde":
+        if dynamics.loss_type == 'brt_hjivi':
+            loss_fn = losses.init_brt_hjivi_loss(dynamics, orig_opt.minWith, orig_opt.dirichlet_loss_divisor)
+        elif dynamics.loss_type == 'brat_hjivi':
+            loss_fn = losses.init_brat_hjivi_loss(dynamics, orig_opt.minWith, orig_opt.dirichlet_loss_divisor)
+        else:
+            raise NotImplementedError
     else:
-        raise NotImplementedError
+        raise RuntimeError(f"Unknown training objective: {training_objective}")
     experiment.train(
         device=opt.device, batch_size=orig_opt.batch_size, epochs=orig_opt.num_epochs, lr=orig_opt.lr, 
         steps_til_summary=orig_opt.steps_til_summary, epochs_til_checkpoint=orig_opt.epochs_til_ckpt, 
         loss_fn=loss_fn, clip_grad=orig_opt.clip_grad, use_lbfgs=orig_opt.use_lbfgs, adjust_relative_grads=orig_opt.adj_rel_grads,
         val_x_resolution=orig_opt.val_x_resolution, val_y_resolution=orig_opt.val_y_resolution, val_z_resolution=orig_opt.val_z_resolution, val_time_resolution=orig_opt.val_time_resolution,
-        use_CSL=orig_opt.use_CSL, CSL_lr=orig_opt.CSL_lr, CSL_dt=orig_opt.CSL_dt, epochs_til_CSL=orig_opt.epochs_til_CSL, num_CSL_samples=orig_opt.num_CSL_samples, CSL_loss_frac_cutoff=orig_opt.CSL_loss_frac_cutoff, max_CSL_epochs=orig_opt.max_CSL_epochs, CSL_loss_weight=orig_opt.CSL_loss_weight, CSL_batch_size=orig_opt.CSL_batch_size)
+        use_CSL=orig_opt.use_CSL, CSL_lr=orig_opt.CSL_lr, CSL_dt=orig_opt.CSL_dt, epochs_til_CSL=orig_opt.epochs_til_CSL, num_CSL_samples=orig_opt.num_CSL_samples, CSL_loss_frac_cutoff=orig_opt.CSL_loss_frac_cutoff, max_CSL_epochs=orig_opt.max_CSL_epochs, CSL_loss_weight=orig_opt.CSL_loss_weight, CSL_batch_size=orig_opt.CSL_batch_size,
+        supervised_weight=orig_opt.supervised_weight,
+        supervised_safe_weight=getattr(orig_opt, "supervised_safe_weight", 1.0),
+        supervised_unsafe_weight=getattr(orig_opt, "supervised_unsafe_weight", 1.0),
+    )
 
 if (mode == 'all') or (mode == 'test'):
     experiment.test(

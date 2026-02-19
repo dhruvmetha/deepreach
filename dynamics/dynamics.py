@@ -3,6 +3,7 @@ from utils import diff_operators
 
 import math
 import torch
+import os
 
 # during training, states will be sampled uniformly by each state dimension from the model-unit -1 to 1 range (for training stability),
 # which may or may not correspond to proper test ranges
@@ -1172,4 +1173,170 @@ class MultiVehicleCollision(Dynamics):
             'x_axis_idx': 0,
             'y_axis_idx': 1,
             'z_axis_idx': 6,
+        }
+
+
+class CartPole(Dynamics):
+    """
+    CartPole dynamics for HJ PDE training.
+    State: [x, theta, x_dot, theta_dot]
+    Control: horizontal force u in [-u_max, u_max]
+    """
+    def __init__(
+        self, u_max: float, x_bound: float, xdot_bound: float, thetadot_bound: float,
+        gravity: float = None, cart_mass: float = None, pole_mass: float = None, pole_length: float = None,
+        set_mode: str = 'avoid', data_root: str = None
+    ):
+        desc = None
+        desc_path = None
+        if data_root is not None:
+            desc_path = os.path.join(data_root, "dataset_description.json")
+            if os.path.exists(desc_path):
+                import json
+                with open(desc_path, "r") as f:
+                    desc = json.load(f)
+
+        if gravity is None or cart_mass is None or pole_mass is None or pole_length is None:
+            if desc is None:
+                if data_root is None:
+                    raise RuntimeError("CartPole requires physics params or --data_root with dataset_description.json")
+                raise RuntimeError(f"dataset_description.json not found at {desc_path}")
+            phys = desc.get("physical_parameters", {})
+            gravity = phys.get("gravity", gravity)
+            cart_mass = phys.get("cart_mass", cart_mass)
+            pole_mass = phys.get("pole_mass", pole_mass)
+            pole_length = phys.get("pole_length", pole_length)
+            if gravity is None or cart_mass is None or pole_mass is None or pole_length is None:
+                raise RuntimeError("Missing physical parameters in dataset_description.json")
+
+        theta_bound = math.pi
+        if isinstance(desc, dict):
+            achieved = desc.get("achieved_bounds", {})
+            if isinstance(achieved, dict) and achieved:
+                def _max_abs_bound(key: str, fallback: float) -> float:
+                    entry = achieved.get(key, {})
+                    if not isinstance(entry, dict):
+                        return fallback
+                    try:
+                        min_val = float(entry.get("min"))
+                        max_val = float(entry.get("max"))
+                    except (TypeError, ValueError):
+                        return fallback
+                    return max(abs(min_val), abs(max_val))
+
+                x_bound = max(x_bound, _max_abs_bound("x", x_bound))
+                theta_bound = max(theta_bound, _max_abs_bound("theta", theta_bound))
+                xdot_bound = max(xdot_bound, _max_abs_bound("x_dot", xdot_bound))
+                thetadot_bound = max(thetadot_bound, _max_abs_bound("theta_dot", thetadot_bound))
+
+        self.u_max = u_max
+        self.g = gravity
+        self.m_c = cart_mass
+        self.m_p = pole_mass
+        self.l = pole_length
+        self.total_mass = self.m_c + self.m_p
+        self.polemass_length = self.m_p * self.l
+
+        super().__init__(
+            loss_type='brt_hjivi', set_mode=set_mode,
+            state_dim=4, input_dim=5, control_dim=1, disturbance_dim=0,
+            state_mean=[0.0, 0.0, 0.0, 0.0],
+            state_var=[x_bound, theta_bound, xdot_bound, thetadot_bound],
+            value_mean=0.0,
+            value_var=1.0,
+            value_normto=0.02,
+            deepreach_model="exact",
+        )
+
+    def state_test_range(self):
+        return [
+            [-self.state_var[0], self.state_var[0]],
+            [-math.pi, math.pi],
+            [-self.state_var[2], self.state_var[2]],
+            [-self.state_var[3], self.state_var[3]],
+        ]
+
+    def equivalent_wrapped_state(self, state):
+        wrapped = torch.clone(state)
+        wrapped[..., 1] = (wrapped[..., 1] + math.pi) % (2*math.pi) - math.pi
+        return wrapped
+
+    def dsdt(self, state, control, disturbance):
+        x = state[..., 0]
+        theta = state[..., 1]
+        x_dot = state[..., 2]
+        theta_dot = state[..., 3]
+        u = control[..., 0]
+
+        costheta = torch.cos(theta)
+        sintheta = torch.sin(theta)
+
+        temp = (u + self.polemass_length * theta_dot**2 * sintheta) / self.total_mass
+        theta_acc = (self.g * sintheta - costheta * temp) / (
+            self.l * (4.0/3.0 - self.m_p * costheta**2 / self.total_mass)
+        )
+        x_acc = temp - self.polemass_length * theta_acc * costheta / self.total_mass
+
+        dsdt = torch.zeros_like(state)
+        dsdt[..., 0] = x_dot
+        dsdt[..., 1] = theta_dot
+        dsdt[..., 2] = x_acc
+        dsdt[..., 3] = theta_acc
+        return dsdt
+
+    def boundary_fn(self, state):
+        # L2 ball around the origin in normalized coordinates (negative inside).
+        scaled = state / self.state_var.to(device=state.device)
+        return torch.sqrt(torch.sum(scaled ** 2, dim=-1) + 1e-12) - 0.2
+
+    def sample_target_state(self, num_samples):
+        raise NotImplementedError
+
+    def cost_fn(self, state_traj):
+        return torch.min(self.boundary_fn(state_traj), dim=-1).values
+
+    def hamiltonian(self, state, dvds):
+        # Hamiltonian: max_u dvds · f(x,u)
+        # Control appears only in x_acc and theta_acc terms; approximate via finite coefficients.
+        # Use local linearization of control influence.
+        theta = state[..., 1]
+        costheta = torch.cos(theta)
+        sintheta = torch.sin(theta)
+        denom = self.l * (4.0/3.0 - self.m_p * costheta**2 / self.total_mass)
+
+        # Partial derivatives of accelerations w.r.t. control u
+        temp_u = 1.0 / self.total_mass
+        theta_acc_u = (-costheta * temp_u) / denom
+        x_acc_u = temp_u - self.polemass_length * theta_acc_u * costheta / self.total_mass
+
+        # dvds order: [dx, dtheta, dx_dot, dtheta_dot]
+        control_coeff = dvds[..., 2] * x_acc_u + dvds[..., 3] * theta_acc_u
+        ham_control = self.u_max * torch.abs(control_coeff)
+
+        # Drift dynamics (u = 0)
+        u_zero = torch.zeros_like(state[..., 0])
+        drift = self.dsdt(state, u_zero.unsqueeze(-1), 0)
+        ham_drift = torch.sum(dvds * drift, dim=-1)
+        return ham_drift + ham_control
+
+    def optimal_control(self, state, dvds):
+        theta = state[..., 1]
+        costheta = torch.cos(theta)
+        denom = self.l * (4.0/3.0 - self.m_p * costheta**2 / self.total_mass)
+        temp_u = 1.0 / self.total_mass
+        theta_acc_u = (-costheta * temp_u) / denom
+        x_acc_u = temp_u - self.polemass_length * theta_acc_u * costheta / self.total_mass
+        control_coeff = dvds[..., 2] * x_acc_u + dvds[..., 3] * theta_acc_u
+        return (self.u_max * torch.sign(control_coeff))[..., None]
+
+    def optimal_disturbance(self, state, dvds):
+        return 0
+
+    def plot_config(self):
+        return {
+            'state_slices': [0.0, 0.0, 0.0, 0.0],
+            'state_labels': ['x', 'theta', 'x_dot', 'theta_dot'],
+            'x_axis_idx': 0,
+            'y_axis_idx': 1,
+            'z_axis_idx': 2,
         }

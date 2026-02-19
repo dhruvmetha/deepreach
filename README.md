@@ -20,6 +20,11 @@ The future version will include the newest tips and tricks of DeepReach develope
 
 (In the meantime...) This branch provides a moderately refactored version of DeepReach to facilitate easier outside research on DeepReach.
 
+## Full Technical Notebook
+For the complete implementation walkthrough (data path, model, losses, training flow, full dynamics math derivations, configs, and diagnostics), read:
+
+- `MEGA_NOTEBOOK.md`
+
 ## High-Level Structure
 The code is organized as follows:
 * `dynamics/dynamics.py` defines the dynamics of the system.
@@ -53,7 +58,109 @@ pip3 install torch torchvision torchaudio --index-url https://download.pytorch.o
 ```
 python run_experiment.py --mode train --experiment_class DeepReach --dynamics_class Dubins3D --experiment_name dubins3d_tutorial_run --minWith target --goalR 0.25 --velocity 0.6 --omega_max 1.1 --angle_alpha_factor 1.2 --set_mode avoid
 ```
-Note that the script provides many common training arguments, like `num_epochs` and the option to `pretrain`. Up-to-date, documentation for these different training schemes is lacking; feel free to reach out to the lab for questions. `use_CSL` is an experimental training option (similar in spirit to actor-critic methods) being developed by SIA for improved value function learning. 
+Note that the script provides many common training arguments, like `num_epochs` and the option to `pretrain`. For detailed training internals and option behavior, see `MEGA_NOTEBOOK.md`. `use_CSL` is an experimental training option (similar in spirit to actor-critic methods) being developed by SIA for improved value function learning.
+
+## CartPole Hybrid Training (HJ PDE + Supervised Labels)
+This repo now includes an extended CartPole path:
+
+* `dynamics_class=CartPole` uses a CartPole dynamics model and Hamiltonian in `dynamics/dynamics.py`.
+* Training data is loaded from files via `CartPoleDataset` in `utils/dataio.py`.
+* If a supervised label file is present and `num_supervised > 0`, an additional supervised value MSE term is added during training (`roa_labels.txt` by default, or override with `--supervised_labels_file`).
+* To reduce class-imbalance collapse, you can enable `--supervised_balanced_sampling` and/or set class weights with `--supervised_safe_weight` and `--supervised_unsafe_weight`.
+* To make PDE state sampling approximately uniform over stored trajectory points, enable `--trajectory_uniform_sampling`.
+* To run on a smaller trajectory subset, set `--max_trajectory_files` (e.g., `100`).
+
+When `--dynamics_class CartPole` is selected, the dataset path is chosen automatically in `run_experiment.py`.
+
+Expected dataset root (`--data_root`):
+
+* `trajectories/sequence_*.txt`
+* optional `roa_labels.txt` (or `cal_set.txt` if you use the 9-column format and set `--supervised_labels_file cal_set.txt`)
+* `dataset_description.json` (used to auto-load `gravity`, `cart_mass`, `pole_mass`, `pole_length` if not provided)
+
+Small run example:
+```
+python run_experiment.py --mode train \
+  --experiment_class DeepReach \
+  --dynamics_class CartPole \
+  --experiment_name cartpole_small \
+  --minWith target \
+  --u_max 2000 \
+  --x_bound 6 --xdot_bound 5 --thetadot_bound 5 \
+  --set_mode avoid \
+  --data_root /common/users/ss5772/DeepReach/deepreach/cartpole_pybullet \
+  --supervised_labels_file cal_set.txt \
+  --num_supervised 256 \
+  --supervised_weight 1.0 \
+  --supervised_balanced_sampling \
+  --supervised_safe_weight 2.0 \
+  --supervised_unsafe_weight 1.0 \
+  --trajectory_uniform_sampling \
+  --max_trajectory_files 100 \
+  --tMin 0.0 --tMax 2.0 \
+  --numpoints 2000 \
+  --num_epochs 200 \
+  --pretrain --pretrain_iters 200 \
+  --lr 1e-4 \
+  --num_hl 2 --num_nl 128 \
+  --model sine
+```
+
+Temporal consistency mode (CartPole-only, observed-flow PDE residual from trajectories):
+```bash
+python run_experiment.py --mode train \
+  --experiment_class DeepReach \
+  --dynamics_class CartPole \
+  --experiment_name cartpole_temporal \
+  --minWith target \
+  --u_max 2000 \
+  --x_bound 6 --xdot_bound 5 --thetadot_bound 5 \
+  --set_mode avoid \
+  --data_root /common/users/ss5772/DeepReach/deepreach/cartpole_pybullet \
+  --training_objective temporal_consistency \
+  --tc_loss_weight 1.0 \
+  --tc_anchor_weight 0.1 \
+  --tc_t0_mode weighted \
+  --num_supervised 128 \
+  --supervised_labels_file cal_set.txt \
+  --supervised_weight 1.0 \
+  --trajectory_uniform_sampling \
+  --numpoints 2000 \
+  --num_epochs 200 \
+  --lr 1e-4 \
+  --num_hl 2 --num_nl 128 \
+  --model sine
+```
+Notes:
+- `training_objective=hj_pde` remains the default and preserves previous behavior.
+- `training_objective=temporal_consistency` currently supports `CartPoleDataset` only.
+- Temporal loss is `|dV/dt + min(0, ∇V·ẋ_obs)|^2` with `ẋ_obs` from one-step trajectory differences.
+- `--tc_t0_mode {weighted,fixed,off}` controls whether/how `t=tMin` boundary loss is applied.
+- Temporal mode logs `tc_backup`, `tc_anchor`, and `tc_total`.
+
+For implementation-level details of this integration, see `MEGA_NOTEBOOK.md`.
+
+Evaluation tip for imbalanced labels:
+
+1. calibrate threshold on `cal_set.txt`,
+2. then evaluate once on `test_set.txt` with that threshold.
+3. optionally set `--separatrix_margin M` to create a no-decision band `[threshold-M, threshold+M]` and track coverage.
+
+```bash
+python evaluation/eval_roa.py \
+  --experiment_dir runs/cartpole_small \
+  --checkpoint model_final.pth \
+  --cal_set cartpole_pybullet/cal_set.txt \
+  --test_set cartpole_pybullet/test_set.txt \
+  --t_eval 2.0 \
+  --auto_threshold \
+  --optimize_metric f1 \
+  --separatrix_margin 0.0 \
+  --threshold_steps 1001
+```
+
+`evaluation/eval_roa.py` reports specificity in addition to precision/recall/F1/accuracy/balanced accuracy.
+It also supports discrete timestamps via `--timestamp_index` (e.g. `613`), converted using `t_eval = tMin + timestamp_index * dt` (set `--timestamp_dt` or infer from dataset metadata).
 
 ## Monitoring a DeepReach Experiment
 Results for the Dubins3D system specified in the above section can be found in this [online WandB project](https://wandb.ai/aklin/DeepReachTutorial).
