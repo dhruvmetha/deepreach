@@ -202,10 +202,9 @@ def find_label_file(data_root, candidates):
     if not data_root:
         return None
     for name in candidates:
-        for subdir in ["train_test_splits", ""]:
-            path = os.path.join(data_root, subdir, name) if subdir else os.path.join(data_root, name)
-            if os.path.exists(path):
-                return path
+        path = os.path.join(data_root, name)
+        if os.path.exists(path):
+            return path
     return None
 
 
