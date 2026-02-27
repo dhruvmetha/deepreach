@@ -82,6 +82,16 @@ DEFAULTS = {
     "adj_rel_grads": True,
     "dirichlet_loss_divisor": 1.0,
 
+    # early stopping
+    "val_fraction": 0.1,
+    "early_stopping_patience": 50,
+
+    # post-training eval
+    "eval_batch_size": 10000,
+
+    # src samples decay
+    "num_src_samples_decay_epochs": 0,  # linearly decay num_src_samples to 0 over this many epochs (0 = no decay)
+
     # CSL
     "use_CSL": False,
     "CSL_lr": 2e-5,
