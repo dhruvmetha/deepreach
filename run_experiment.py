@@ -94,6 +94,7 @@ if orig_cfg.dynamics_class in ('CartPole', 'Quadrotor2D', 'Quadrotor3D', 'Pendul
         shuffled_indices_file=orig_cfg.shuffled_indices_file,
         load_trajectories_in_ram=orig_cfg.load_trajectories_in_ram,
         training_objective=orig_cfg.training_objective,
+        val_fraction=orig_cfg.val_fraction,
     )
     if orig_cfg.dynamics_class == 'Quadrotor2D':
         dataset = dataio.Quadrotor2DDataset(**_dataset_kwargs)
@@ -156,6 +157,9 @@ if (mode == 'all') or (mode == 'train'):
         supervised_weight=orig_cfg.supervised_weight,
         supervised_safe_weight=orig_cfg.supervised_safe_weight,
         supervised_unsafe_weight=orig_cfg.supervised_unsafe_weight,
+        early_stopping_patience=orig_cfg.early_stopping_patience,
+        eval_batch_size=orig_cfg.eval_batch_size,
+        num_src_samples_decay_epochs=orig_cfg.num_src_samples_decay_epochs,
     )
 
 if (mode == 'all') or (mode == 'test'):
