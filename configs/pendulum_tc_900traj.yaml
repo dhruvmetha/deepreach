@@ -1,0 +1,44 @@
+# Pendulum temporal consistency training (first 900 trajectories from shuffled list)
+# Usage: python run_experiment.py -c configs/pendulum_tc_900traj.yaml
+
+mode: train
+experiment_name: pendulum_tc_900traj
+# experiments_dir: /common/users/shared/pracsys/adaptive_roa_experiments/dhruv/deepreach/${experiment_name}1
+experiments_dir: /common/users/ss5772/DeepReach/deepreach/runs_trajectory_split
+experiment_class: DeepReach
+dynamics_class: Pendulum
+training_objective: temporal_consistency
+minWith: target
+
+set_mode: avoid
+
+# Dataset
+data_root: /common/users/shared/pracsys/genMoPlan/data_trajectories/pendulum_lqr_50k
+use_shuffled_indices_only: true
+shuffled_indices_file: train_test_splits/shuffled_indices_0.txt
+load_trajectories_in_ram: true
+trajectory_uniform_sampling: true
+max_trajectory_files: 900
+supervised_weight: 0.0
+
+tMin: 0.0
+tMax: 10.0
+numpoints: 1000
+
+# Training
+num_epochs: 50000
+pretrain: false
+pretrain_iters: 0
+counter_start: 35000
+counter_end: 35000
+lr: 1e-4
+num_hl: 2
+num_nl: 96
+model: sine
+steps_til_summary: 100
+epochs_til_ckpt: 500
+val_z_resolution: 1
+num_src_samples: 100
+
+device: "cuda:0"
+seed: 0

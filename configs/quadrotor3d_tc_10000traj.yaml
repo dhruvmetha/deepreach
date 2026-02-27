@@ -1,0 +1,58 @@
+# Quadrotor3D temporal consistency training (first 9000 trajectories from shuffled list; 10000-stage with 90/10 split)
+# Usage: python run_experiment.py -c configs/quadrotor3d_tc_10000traj.yaml
+
+mode: train
+experiment_name: quadrotor3d_tc_10000traj
+experiments_dir: /common/users/ss5772/DeepReach/deepreach/runs_trajectory_split
+experiment_class: DeepReach
+dynamics_class: Quadrotor3D
+training_objective: temporal_consistency
+minWith: target
+
+set_mode: avoid
+
+# Bounds (defaults from Quadrotor3D class; override as needed)
+# x_bound: 1.5
+# y_bound: 1.5
+# z_bound: 1.5
+# qw_bound: 1.0
+# qx_bound: 1.0
+# qy_bound: 1.0
+# qz_bound: 1.0
+# vx_bound: 10.0
+# vy_bound: 10.0
+# vz_bound: 10.0
+# wx_bound: 10.0
+# wy_bound: 10.0
+# wz_bound: 10.0
+
+# Dataset — update this path to your Quadrotor3D trajectory data
+data_root: /common/users/shared/pracsys/genMoPlan/data_trajectories/quadrotor3D_lqr
+use_shuffled_indices_only: true
+shuffled_indices_file: train_test_splits/shuffled_indices.txt
+load_trajectories_in_ram: true
+trajectory_uniform_sampling: true
+max_trajectory_files: 9000
+supervised_weight: 0.0
+
+tMin: 0.0
+tMax: 10.0
+numpoints: 1000
+
+# Training
+num_epochs: 50000
+pretrain: false
+pretrain_iters: 0
+counter_start: 35000
+counter_end: 35000
+lr: 1e-4
+num_hl: 2
+num_nl: 96
+model: sine
+steps_til_summary: 100
+epochs_til_ckpt: 5000
+val_z_resolution: 1
+num_src_samples: 100
+
+device: "cuda:0"
+seed: 0

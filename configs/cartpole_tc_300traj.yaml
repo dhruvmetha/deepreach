@@ -1,0 +1,47 @@
+# CartPole temporal consistency training (first 270 trajectories from shuffled list; 300-stage with 90/10 split)
+# Usage: python run_experiment.py -c configs/cartpole_tc_300traj.yaml
+
+mode: train
+experiment_name: cartpole_tc_300traj
+experiments_dir: /common/users/ss5772/DeepReach/deepreach/runs_trajectory_split
+experiment_class: DeepReach
+dynamics_class: CartPole
+training_objective: temporal_consistency
+minWith: target
+
+u_max: 2000
+x_bound: 6
+xdot_bound: 5
+thetadot_bound: 5
+set_mode: avoid
+
+# Dataset
+data_root: /common/users/shared/pracsys/genMoPlan/data_trajectories/cartpole_pybullet
+use_shuffled_indices_only: true
+shuffled_indices_file: train_test_splits/shuffled_indices_0.txt
+load_trajectories_in_ram: true
+trajectory_uniform_sampling: true
+max_trajectory_files: 270
+supervised_weight: 0.0
+
+tMin: 0.0
+tMax: 10.0
+numpoints: 1000
+
+# Training
+num_epochs: 50000
+pretrain: false
+pretrain_iters: 0
+counter_start: 35000
+counter_end: 35000
+lr: 1e-4
+num_hl: 2
+num_nl: 96
+model: sine
+steps_til_summary: 100
+epochs_til_ckpt: 500
+val_z_resolution: 1
+num_src_samples: 100
+
+device: "cuda:0"
+seed: 0
