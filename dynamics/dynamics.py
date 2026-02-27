@@ -123,15 +123,15 @@ class Dynamics(ABC):
             return (output * self.value_var / self.value_normto) + self.value_mean
 
     # convert model io to real dv
-    def io_to_dv(self, input, output):
-        dodi = diff_operators.jacobian(output.unsqueeze(dim=-1), input)[0].squeeze(dim=-2)
+    def io_to_dv(self, input, output, create_graph=True):
+        dodi = diff_operators.jacobian(output.unsqueeze(dim=-1), input, create_graph=create_graph)[0].squeeze(dim=-2)
 
         if self.deepreach_model=="diff":
             dvdt = (self.value_var / self.value_normto) * dodi[..., 0]
 
             dvds_term1 = (self.value_var / self.value_normto / self.state_var.to(device=dodi.device)) * dodi[..., 1:]
             state = self.input_to_coord(input)[..., 1:]
-            dvds_term2 = diff_operators.jacobian(self.boundary_fn(state).unsqueeze(dim=-1), state)[0].squeeze(dim=-2)
+            dvds_term2 = diff_operators.jacobian(self.boundary_fn(state).unsqueeze(dim=-1), state, create_graph=create_graph)[0].squeeze(dim=-2)
             dvds = dvds_term1 + dvds_term2
         elif self.deepreach_model=="exact":
             dvdt = (self.value_var / self.value_normto) * \
@@ -141,12 +141,12 @@ class Dynamics(ABC):
                           self.state_var.to(device=dodi.device)) * dodi[..., 1:] * input[..., 0].unsqueeze(-1)
             state = self.input_to_coord(input)[..., 1:]
             dvds_term2 = diff_operators.jacobian(self.boundary_fn(
-                state).unsqueeze(dim=-1), state)[0].squeeze(dim=-2)
+                state).unsqueeze(dim=-1), state, create_graph=create_graph)[0].squeeze(dim=-2)
             dvds = dvds_term1 + dvds_term2
         else:
             dvdt = (self.value_var / self.value_normto) * dodi[..., 0]
             dvds = (self.value_var / self.value_normto / self.state_var.to(device=dodi.device)) * dodi[..., 1:]
-        
+
         return torch.cat((dvdt.unsqueeze(dim=-1), dvds), dim=-1)
 
     # ALL FOLLOWING METHODS USE REAL UNITS
@@ -844,21 +844,21 @@ class RocketLanding(Dynamics):
             return (output * self.value_var / self.value_normto) + self.value_mean
 
     # convert model io to real dv
-    def io_to_dv(self, input, output):
-        dodi = diff_operators.jacobian(output.unsqueeze(dim=-1), input)[0].squeeze(dim=-2)[..., :-1]
+    def io_to_dv(self, input, output, create_graph=True):
+        dodi = diff_operators.jacobian(output.unsqueeze(dim=-1), input, create_graph=create_graph)[0].squeeze(dim=-2)[..., :-1]
 
         if self.deepreach_model=="diff":
             dvdt = (self.value_var / self.value_normto) * dodi[..., 0]
 
             dvds_term1 = (self.value_var / self.value_normto / self.state_var.to(device=dodi.device)) * dodi[..., 1:]
             state = self.input_to_coord(input)[..., 1:]
-            dvds_term2 = diff_operators.jacobian(self.boundary_fn(state).unsqueeze(dim=-1), state)[0].squeeze(dim=-2)
+            dvds_term2 = diff_operators.jacobian(self.boundary_fn(state).unsqueeze(dim=-1), state, create_graph=create_graph)[0].squeeze(dim=-2)
             dvds = dvds_term1 + dvds_term2
-        
+
         else:
             dvdt = (self.value_var / self.value_normto) * dodi[..., 0]
             dvds = (self.value_var / self.value_normto / self.state_var.to(device=dodi.device)) * dodi[..., 1:]
-        
+
         return torch.cat((dvdt.unsqueeze(dim=-1), dvds), dim=-1)
 
 
