@@ -1,3 +1,4 @@
+import copy
 import wandb
 import torch
 import os
@@ -141,6 +142,9 @@ class Experiment(ABC):
             supervised_weight=0.0,
             supervised_safe_weight=1.0,
             supervised_unsafe_weight=1.0,
+            early_stopping_patience=0,
+            eval_batch_size=10000,
+            num_src_samples_decay_epochs=0,
         ):
         was_eval = not self.model.training
         self.model.train()
@@ -179,10 +183,76 @@ class Experiment(ABC):
         if temporal_mode and use_CSL:
             raise RuntimeError("use_CSL is not supported with training_objective=temporal_consistency.")
 
+        # --- Src samples decay setup ---
+        num_src_samples_initial = self.dataset.num_src_samples
+        if num_src_samples_decay_epochs > 0 and temporal_mode:
+            print(f"[SrcDecay] num_src_samples will decay from {num_src_samples_initial} to 0 "
+                  f"over {num_src_samples_decay_epochs} epochs")
+
+        # --- Early stopping setup ---
+        val_transitions = None
+        best_val_loss = float('inf')
+        best_model_state = None
+        patience_counter = 0
+        # Top-K best checkpoints: list of (val_loss, filename) sorted best→worst
+        top_k_best = 3
+        best_checkpoints = []  # [(val_loss, filename), ...]
+        early_stop_enabled = (
+            temporal_mode and early_stopping_patience > 0
+            and hasattr(self.dataset, 'compute_all_val_transitions')
+        )
+        if early_stop_enabled:
+            val_transitions = self.dataset.compute_all_val_transitions()
+            if val_transitions is None:
+                early_stop_enabled = False
+                print("[EarlyStopping] No val transitions available, early stopping disabled.")
+            else:
+                val_transitions = {k: v.to(device) for k, v in val_transitions.items()}
+                print(f"[EarlyStopping] Enabled with patience={early_stopping_patience}, "
+                      f"{val_transitions['tc_model_coords_curr'].shape[0]} val transitions")
+
+        def _compute_val_loss():
+            """Compute mean TC loss over all val transitions in mini-batches."""
+            self.model.eval()
+            total_loss = 0.0
+            n_total = val_transitions['tc_model_coords_curr'].shape[0]
+            batch_size_val = eval_batch_size
+            for start in range(0, n_total, batch_size_val):
+                end = min(start + batch_size_val, n_total)
+                coords_batch = val_transitions['tc_model_coords_curr'][start:end].detach().requires_grad_(True)
+                obs_flow_batch = val_transitions['tc_obs_flow'][start:end]
+                boundary_batch = val_transitions['tc_boundary_values'][start:end]
+
+                results = self.model({'coords': coords_batch})
+                model_in = results['model_in']
+                output = results['model_out'].squeeze(dim=-1)
+
+                values = self.dataset.dynamics.io_to_value(
+                    model_in.detach(), output,
+                )
+                dvs = self.dataset.dynamics.io_to_dv(
+                    model_in, output, create_graph=False,
+                )
+                dvdt = dvs[..., 0]
+                dvds = dvs[..., 1:]
+
+                batch_losses = loss_fn(values, dvdt, dvds, obs_flow_batch, boundary_batch)
+                # loss_fn returns .sum() over batch; accumulate raw sum
+                batch_loss = sum(l.item() for l in batch_losses.values())
+                total_loss += batch_loss
+
+            self.model.train()
+            return total_loss / n_total
+
         with tqdm(total=len(train_dataloader) * epochs) as pbar:
             train_losses = []
             last_CSL_epoch = -1
             for epoch in range(0, epochs):
+                # Decay num_src_samples linearly
+                if num_src_samples_decay_epochs > 0 and not self.dataset.pretrain:
+                    frac = min(epoch / num_src_samples_decay_epochs, 1.0)
+                    self.dataset.num_src_samples = max(5, int(num_src_samples_initial * (1.0 - frac)))
+
                 if self.dataset.pretrain: # skip CSL
                     last_CSL_epoch = epoch
                 time_interval_length = (self.dataset.counter/self.dataset.counter_end)*(self.dataset.tMax-self.dataset.tMin)
@@ -364,12 +434,12 @@ class Experiment(ABC):
                         writer.add_scalar("supervised_loss", supervised_loss, total_steps)
                         train_loss += supervised_loss
 
-                    train_losses.append(train_loss.item())
-                    writer.add_scalar("total_train_loss", train_loss, total_steps)
+                    train_loss_mean = train_loss.item() / self.dataset.numpoints
+                    train_losses.append(train_loss_mean)
+                    writer.add_scalar("total_train_loss", train_loss_mean, total_steps)
 
                     if not total_steps % steps_til_summary:
-                        torch.save(self.model.state_dict(),
-                                os.path.join(checkpoints_dir, 'model_current.pth'))
+                        pass  # checkpoint saving handled by top-K best logic
                         # summary_fn(model, model_input, gt, model_output, writer, total_steps)
 
                     if not use_lbfgs:
@@ -387,19 +457,64 @@ class Experiment(ABC):
                     pbar.update(1)
 
                     if not total_steps % steps_til_summary:
-                        tqdm.write("Epoch %d, Total loss %0.6f, iteration time %0.6f" % (epoch, train_loss, time.time() - start_time))
+                        tqdm.write("Epoch %d, Total loss %0.6f, iteration time %0.6f" % (epoch, train_loss_mean, time.time() - start_time))
                         if self.use_wandb:
                             wandb_payload = {
                                 'step': epoch,
-                                'train_loss': train_loss,
+                                'train_loss': train_loss_mean,
                             }
                             if 'diff_constraint_hom' in losses:
-                                wandb_payload['pde_loss'] = losses['diff_constraint_hom']
+                                wandb_payload['pde_loss'] = losses['diff_constraint_hom'].item() / self.dataset.numpoints
                             if 'dirichlet' in losses:
-                                wandb_payload['dirichlet_loss'] = losses['dirichlet']
+                                wandb_payload['dirichlet_loss'] = losses['dirichlet'].item() / self.dataset.numpoints
                             wandb.log(wandb_payload)
 
                     total_steps += 1
+
+                # --- Early stopping val check ---
+                early_stopped = False
+                if (early_stop_enabled
+                        and not self.dataset.pretrain
+                        and total_steps > 0
+                        and not total_steps % steps_til_summary):
+                    val_loss = _compute_val_loss()
+                    writer.add_scalar("val_loss", val_loss, total_steps)
+                    if self.use_wandb:
+                        wandb.log({'step': epoch, 'val_loss': val_loss})
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        patience_counter = 0
+                        best_model_state = copy.deepcopy(self.model.state_dict())
+                        tqdm.write(f"[EarlyStopping] New best val_loss={val_loss:.6f} at epoch {epoch}")
+
+                    # Top-K best checkpoint management
+                    save_this = (len(best_checkpoints) < top_k_best
+                                 or val_loss < best_checkpoints[-1][0])
+                    if save_this:
+                        ckpt_name = f'model_best_epoch{epoch}_val{val_loss:.6f}.pth'
+                        torch.save(self.model.state_dict(),
+                                   os.path.join(checkpoints_dir, ckpt_name))
+                        best_checkpoints.append((val_loss, ckpt_name))
+                        best_checkpoints.sort(key=lambda x: x[0])
+                        # Remove worst if over budget
+                        while len(best_checkpoints) > top_k_best:
+                            _, removed_name = best_checkpoints.pop()
+                            removed_path = os.path.join(checkpoints_dir, removed_name)
+                            if os.path.exists(removed_path):
+                                os.remove(removed_path)
+                                tqdm.write(f"[TopK] Removed {removed_name}")
+
+                    if val_loss >= best_val_loss:
+                        patience_counter += 1
+                        tqdm.write(f"[EarlyStopping] val_loss={val_loss:.6f} (best={best_val_loss:.6f}), "
+                                   f"patience {patience_counter}/{early_stopping_patience}")
+                    if patience_counter >= early_stopping_patience:
+                        tqdm.write(f"[EarlyStopping] Stopping at epoch {epoch} "
+                                   f"(no improvement for {early_stopping_patience} checks)")
+                        early_stopped = True
+
+                if early_stopped:
+                    break
 
                 # cost-supervised learning (CSL) phase
                 if use_CSL and not self.dataset.pretrain and (epoch-last_CSL_epoch) >= epochs_til_CSL:
@@ -588,21 +703,91 @@ class Experiment(ABC):
                             break
 
                 if not (epoch+1) % epochs_til_checkpoint:
-                    # Saving the optimizer state is important to produce consistent results
-                    checkpoint = {
-                        'epoch': epoch+1,
-                        'model': self.model.state_dict(),
-                        'optimizer': optim.state_dict(),
-                        'tMax': self.dataset.tMax,
-                        'tMin': self.dataset.tMin,
-                    }
-                    torch.save(checkpoint,
-                        os.path.join(checkpoints_dir, 'model_epoch_%04d.pth' % (epoch+1)))
                     np.savetxt(os.path.join(checkpoints_dir, 'train_losses_epoch_%04d.txt' % (epoch+1)),
                         np.array(train_losses))
                     self.validate(
                         device=device, epoch=epoch+1, save_path=os.path.join(checkpoints_dir, 'BRS_validation_plot_epoch_%04d.png' % (epoch+1)),
                         x_resolution = val_x_resolution, y_resolution = val_y_resolution, z_resolution=val_z_resolution, time_resolution=val_time_resolution)
+
+        # --- Post-training: restore best weights and save model_final ---
+        if best_checkpoints:
+            best_loss, best_name = best_checkpoints[0]
+            best_path = os.path.join(checkpoints_dir, best_name)
+            self.model.load_state_dict(torch.load(best_path, map_location=device))
+            print(f"[PostTraining] Loaded best checkpoint {best_name} (val_loss={best_loss:.6f})")
+        elif early_stop_enabled and best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
+            print(f"[EarlyStopping] Restored best model weights (val_loss={best_val_loss:.6f})")
+
+        torch.save(self.model.state_dict(),
+                   os.path.join(checkpoints_dir, 'model_final.pth'))
+
+        # --- Post-training eval on train/val/test sets ---
+        if temporal_mode:
+            self.model.eval()
+            self.model.requires_grad_(False)
+            import csv
+
+            def _eval_and_save_csv(states, labels, csv_path):
+                """Batched forward pass at tMax → CSV with state cols, label, value."""
+                times = torch.full((states.shape[0], 1), self.dataset.tMax)
+                coords = torch.cat((times, states), dim=-1)
+                model_coords = self.dataset._coord_to_model_input(coords)
+                values = []
+                batch_sz = eval_batch_size
+                for start in range(0, model_coords.shape[0], batch_sz):
+                    end = min(start + batch_sz, model_coords.shape[0])
+                    batch = model_coords[start:end].to(device)
+                    with torch.no_grad():
+                        results = self.model({'coords': batch})
+                        v = self.dataset.dynamics.io_to_value(
+                            results['model_in'], results['model_out'].squeeze(dim=-1)
+                        )
+                    values.append(v.cpu())
+                values = torch.cat(values, dim=0)
+                sd = self.dataset.dynamics.state_dim
+                with open(csv_path, 'w', newline='') as f:
+                    writer_csv = csv.writer(f)
+                    header = [f's{i}' for i in range(sd)] + ['label', 'value']
+                    writer_csv.writerow(header)
+                    for j in range(states.shape[0]):
+                        row = [f'{states[j, k].item():.6f}' for k in range(sd)]
+                        row.append(str(int(labels[j].item())))
+                        row.append(f'{values[j].item():.6f}')
+                        writer_csv.writerow(row)
+                print(f"[PostTrainEval] Saved {states.shape[0]} rows to {csv_path}")
+
+            # Eval on train/val trajectory sets
+            if (hasattr(self.dataset, 'get_all_states_and_labels')
+                    and self.dataset.traj_labels is not None):
+                for split in ['train', 'val']:
+                    states, labels = self.dataset.get_all_states_and_labels(split=split)
+                    if states is None:
+                        continue
+                    _eval_and_save_csv(states, labels,
+                                       os.path.join(checkpoints_dir, f'eval_{split}.csv'))
+
+            # Eval on test set (initial conditions with labels, e.g. test_set.txt)
+            data_root = getattr(self.dataset, 'data_root', None)
+            if data_root is not None:
+                sd = self.dataset.dynamics.state_dim
+                test_candidates = ['test_set.txt', 'cal_set.txt']
+                for candidate in test_candidates:
+                    test_path = os.path.join(data_root, candidate)
+                    if os.path.exists(test_path):
+                        test_data = torch.tensor(
+                            self.dataset._load_txt(test_path), dtype=torch.float32)
+                        if test_data.ndim == 1:
+                            test_data = test_data.unsqueeze(0)
+                        test_states = test_data[:, :sd]
+                        test_labels = test_data[:, -1]
+                        _eval_and_save_csv(test_states, test_labels,
+                                           os.path.join(checkpoints_dir, 'eval_test.csv'))
+                        print(f"[PostTrainEval] Test set source: {test_path}")
+                        break
+
+            self.model.train()
+            self.model.requires_grad_(True)
 
         if was_eval:
             self.model.eval()
