@@ -26,11 +26,13 @@ set_mode: avoid
 # wy_bound: 10.0
 # wz_bound: 10.0
 
-# Dataset — update this path to your Quadrotor3D trajectory data
+# Dataset
 data_root: /common/users/shared/pracsys/genMoPlan/data_trajectories/quadrotor3D_lqr
+use_shuffled_indices_only: true
+shuffled_indices_file: train_test_splits/all_shuffled_indices.txt
 load_trajectories_in_ram: true
 trajectory_uniform_sampling: true
-max_trajectory_files: 14000
+max_trajectory_files: 25000
 supervised_weight: 0.0
 
 tMin: 0.0
@@ -51,6 +53,12 @@ steps_til_summary: 100
 epochs_til_ckpt: 5000
 val_z_resolution: 1
 num_src_samples: 100
+num_src_samples_decay_epochs: 1000
+
+# Early stopping & eval
+val_fraction: 0.1
+early_stopping_patience: 50
+eval_batch_size: 10000
 
 device: "cuda:0"
 seed: 0

@@ -42,6 +42,12 @@ steps_til_summary: 100
 epochs_til_ckpt: 500
 val_z_resolution: 1
 num_src_samples: 100
+num_src_samples_decay_epochs: 1000
+
+# Early stopping & eval
+val_fraction: 0.1
+early_stopping_patience: 50
+eval_batch_size: 10000
 
 device: "cuda:0"
 seed: 0

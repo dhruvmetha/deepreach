@@ -3,7 +3,7 @@
 
 mode: train
 experiment_name: pendulum_tc
-experiments_dir: /common/users/shared/pracsys/adaptive_roa_experiments/dhruv/deepreach/${experiment_name}1
+experiments_dir: /common/users/shared/pracsys/adaptive_roa_experiments/dhruv/deepreach/${experiment_name}
 experiment_class: DeepReach
 dynamics_class: Pendulum
 training_objective: temporal_consistency
@@ -38,6 +38,12 @@ steps_til_summary: 100
 epochs_til_ckpt: 500
 val_z_resolution: 1
 num_src_samples: 100
+num_src_samples_decay_epochs: 1000
+
+# Early stopping & eval
+val_fraction: 0.1
+early_stopping_patience: 100
+eval_batch_size: 10000
 
 device: "cuda:0"
 seed: 0

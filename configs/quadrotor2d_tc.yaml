@@ -16,8 +16,10 @@ zdot_bound: 1.0
 thetadot_bound: 8.0
 set_mode: avoid
 
-# Dataset — update this path to your Quadrotor2D trajectory data
+# Dataset
 data_root: /common/users/shared/pracsys/genMoPlan/data_trajectories/quadrotor2D_rl
+use_shuffled_indices_only: true
+shuffled_indices_file: train_test_splits/shuffled_indices_0.txt
 load_trajectories_in_ram: true
 trajectory_uniform_sampling: true
 max_trajectory_files: 12000
@@ -41,6 +43,12 @@ steps_til_summary: 100
 epochs_til_ckpt: 500
 val_z_resolution: 1
 num_src_samples: 100
+num_src_samples_decay_epochs: 1000
+
+# Early stopping & eval
+val_fraction: 0.1
+early_stopping_patience: 50
+eval_batch_size: 10000
 
 device: "cuda:0"
 seed: 0
