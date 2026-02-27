@@ -119,6 +119,7 @@ class CartPoleDataset(Dataset):
         load_trajectories_in_ram=False,
         training_objective='hj_pde',
         angle_wrap_dims=None,
+        val_fraction=0.0,
     ):
         self.dynamics = dynamics
         self.numpoints = numpoints
@@ -160,19 +161,44 @@ class CartPoleDataset(Dataset):
             [os.path.join(traj_dir, f) for f in os.listdir(traj_dir)
              if f.startswith("sequence_") and f.endswith(".txt")]
         )
+        self.traj_labels = None
+        self.val_traj_labels = None
         if self.use_shuffled_indices_only:
             shuffled_path = self._resolve_shuffled_indices_file()
             self.traj_files = self._filter_traj_files_by_shuffled_indices(self.traj_files, shuffled_path)
+            # Load per-trajectory labels (e.g. shuffled_labels_0.txt alongside shuffled_indices_0.txt)
+            shuffled_labels_path = shuffled_path.replace("indices", "labels")
+            if os.path.exists(shuffled_labels_path):
+                with open(shuffled_labels_path, "r") as f:
+                    self.traj_labels = [int(line.strip()) for line in f if line.strip()]
+                if len(self.traj_labels) != len(self.traj_files):
+                    print(f"[CartPoleDataset] Warning: {len(self.traj_labels)} labels vs {len(self.traj_files)} trajectories; discarding labels")
+                    self.traj_labels = None
         if not self.traj_files:
             raise RuntimeError(f"No trajectory files found in {traj_dir}")
         if self.max_trajectory_files > 0 and self.max_trajectory_files < len(self.traj_files):
             # When using shuffled indices, take first N (deterministic). Otherwise random sample.
             if self.use_shuffled_indices_only:
                 self.traj_files = self.traj_files[: self.max_trajectory_files]
+                if self.traj_labels is not None:
+                    self.traj_labels = self.traj_labels[: self.max_trajectory_files]
             else:
                 perm = torch.randperm(len(self.traj_files))
                 keep = perm[:self.max_trajectory_files].tolist()
                 self.traj_files = [self.traj_files[i] for i in keep]
+                if self.traj_labels is not None:
+                    self.traj_labels = [self.traj_labels[i] for i in keep]
+
+        self.val_traj_files = []
+        self.val_traj_state_cache = None
+        if val_fraction > 0.0 and len(self.traj_files) >= 2:
+            n_val = max(1, int(len(self.traj_files) * val_fraction))
+            self.val_traj_files = self.traj_files[-n_val:]
+            self.traj_files = self.traj_files[:-n_val]
+            if self.traj_labels is not None:
+                self.val_traj_labels = self.traj_labels[-n_val:]
+                self.traj_labels = self.traj_labels[:len(self.traj_files)]
+            print(f"[CartPoleDataset] Train/val split: {len(self.traj_files)} train, {len(self.val_traj_files)} val trajectories")
 
         self.traj_state_cache = None
         self.traj_lengths = None
@@ -199,6 +225,12 @@ class CartPoleDataset(Dataset):
                 [traj_states.shape[0] for traj_states in self.traj_state_cache],
                 dtype=torch.long
             )
+
+        if self.load_trajectories_in_ram and self.val_traj_files:
+            self.val_traj_state_cache = [
+                self._pad_states_to_tmax(torch.tensor(self._load_txt(p), dtype=torch.float32))
+                for p in self.val_traj_files
+            ]
 
         self.traj_sampling_weights = None
         if self.trajectory_uniform_sampling:
@@ -263,6 +295,28 @@ class CartPoleDataset(Dataset):
         self._advance_counters()
         self._append_supervised_samples(model_input, gt)
         return model_input, gt
+
+    def get_all_states_and_labels(self, split='train'):
+        """Return (states_tensor [N, state_dim], labels_tensor [N]) for all states in split."""
+        if split == 'train':
+            files, labels, cache = self.traj_files, self.traj_labels, self.traj_state_cache
+        else:
+            files, labels, cache = self.val_traj_files, self.val_traj_labels, self.val_traj_state_cache
+
+        if labels is None:
+            return None, None
+
+        all_states = []
+        all_labels = []
+        for i, path in enumerate(files):
+            if cache is not None:
+                states = cache[i]
+            else:
+                states = torch.tensor(self._load_txt(path), dtype=torch.float32)
+            all_states.append(states)
+            all_labels.append(torch.full((states.shape[0],), labels[i], dtype=torch.float32))
+
+        return torch.cat(all_states, dim=0), torch.cat(all_labels, dim=0)
 
     def _sample_hj_batch(self):
         if self.traj_sampling_weights is not None:
@@ -602,6 +656,59 @@ class CartPoleDataset(Dataset):
             states = torch.tensor(self._load_txt(path), dtype=torch.float32)
             traj_state_cache.append(self._pad_states_to_tmax(states))
         return traj_state_cache
+
+    def compute_all_val_transitions(self):
+        """Return all consecutive (state_t, state_{t+1}) transitions from val trajectories.
+
+        Returns a dict with keys: tc_model_coords_curr, tc_obs_flow, tc_boundary_values,
+        or None if no val data is available.
+        """
+        if not self.val_traj_files:
+            return None
+
+        all_model_coords = []
+        all_obs_flow = []
+        all_boundary = []
+
+        for i, path in enumerate(self.val_traj_files):
+            if self.val_traj_state_cache is not None:
+                states = self.val_traj_state_cache[i]
+            else:
+                states = torch.tensor(self._load_txt(path), dtype=torch.float32)
+                states = self._pad_states_to_tmax(states)
+
+            traj_len = states.shape[0]
+            if traj_len < 2:
+                continue
+
+            curr_states = states[:-1]
+            next_states = states[1:]
+            n = curr_states.shape[0]
+
+            times = torch.full((n, 1), self.tMax)
+
+            coords = torch.cat((times, curr_states), dim=-1)
+            model_coords = self._coord_to_model_input(coords)
+            all_model_coords.append(model_coords)
+
+            state_delta = next_states - curr_states
+            for wrap_dim in self.angle_wrap_dims:
+                state_delta[..., wrap_dim] = self._wrapped_angle_diff(
+                    next_states[..., wrap_dim], curr_states[..., wrap_dim]
+                )
+            obs_flow = state_delta / self.dt
+            all_obs_flow.append(obs_flow)
+
+            all_boundary.append(self.dynamics.boundary_fn(curr_states))
+
+        if not all_model_coords:
+            return None
+
+        return {
+            'tc_model_coords_curr': torch.cat(all_model_coords, dim=0),
+            'tc_obs_flow': torch.cat(all_obs_flow, dim=0),
+            'tc_boundary_values': torch.cat(all_boundary, dim=0),
+        }
 
 
 class Quadrotor2DDataset(CartPoleDataset):
