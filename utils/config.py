@@ -70,6 +70,7 @@ DEFAULTS = {
     "model_mode": "mlp",
     "num_hl": 3,
     "num_nl": 512,
+    "omega_0": 30.0,
     "deepreach_model": "exact",
 
     # training

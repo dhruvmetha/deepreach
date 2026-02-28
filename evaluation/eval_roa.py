@@ -266,7 +266,8 @@ def main():
 
     # Build model
     model = modules.SingleBVPNet(in_features=dynamics.input_dim, out_features=1, type=opt.model, mode=opt.model_mode,
-                                 final_layer_factor=1., hidden_features=opt.num_nl, num_hidden_layers=opt.num_hl)
+                                 final_layer_factor=1., hidden_features=opt.num_nl, num_hidden_layers=opt.num_hl,
+                                 omega_0=getattr(opt, 'omega_0', 30.0))
     model.to(args.device)
     model.eval()
 

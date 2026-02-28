@@ -46,12 +46,12 @@ class BatchLinear(nn.Linear):
 
 
 class Sine(nn.Module):
-    def __init(self):
+    def __init__(self, omega_0=30.0):
         super().__init__()
+        self.omega_0 = omega_0
 
     def forward(self, input):
-        # See paper sec. 3.2, final paragraph, and supplement Sec. 1.5 for discussion of factor 30
-        return torch.sin(30 * input)
+        return torch.sin(self.omega_0 * input)
 
 
 class FCBlock(nn.Module):
@@ -59,14 +59,14 @@ class FCBlock(nn.Module):
     '''
 
     def __init__(self, in_features, out_features, num_hidden_layers, hidden_features,
-                 outermost_linear=False, nonlinearity='relu', weight_init=None):
+                 outermost_linear=False, nonlinearity='relu', weight_init=None, omega_0=30.0):
         super().__init__()
 
         self.first_layer_init = None
 
         # Dictionary that maps nonlinearity name to the respective function, initialization, and, if applicable,
         # special first-layer initialization scheme
-        nls_and_inits = {'sine':(Sine(), sine_init, first_layer_sine_init),
+        nls_and_inits = {'sine':(Sine(omega_0), lambda m: sine_init(m, omega_0), first_layer_sine_init),
                          'relu':(nn.ReLU(inplace=True), init_weights_normal, None),
                          'sigmoid':(nn.Sigmoid(), init_weights_xavier, None),
                          'tanh':(nn.Tanh(), init_weights_xavier, None),
@@ -117,11 +117,11 @@ class SingleBVPNet(nn.Module):
     '''A canonical representation network for a BVP.'''
 
     def __init__(self, out_features=1, type='sine', in_features=2,
-                 mode='mlp', hidden_features=256, num_hidden_layers=3, **kwargs):
+                 mode='mlp', hidden_features=256, num_hidden_layers=3, omega_0=30.0, **kwargs):
         super().__init__()
         self.mode = mode
         self.net = FCBlock(in_features=in_features, out_features=out_features, num_hidden_layers=num_hidden_layers,
-                           hidden_features=hidden_features, outermost_linear=True, nonlinearity=type)
+                           hidden_features=hidden_features, outermost_linear=True, nonlinearity=type, omega_0=omega_0)
         print(self)
 
     def forward(self, model_input, params=None):
@@ -166,12 +166,11 @@ def init_weights_xavier(m):
             nn.init.xavier_normal_(m.weight)
 
 
-def sine_init(m):
+def sine_init(m, omega_0=30.0):
     with torch.no_grad():
         if hasattr(m, 'weight'):
             num_input = m.weight.size(-1)
-            # See supplement Sec. 1.5 for discussion of factor 30
-            m.weight.uniform_(-np.sqrt(6 / num_input) / 30, np.sqrt(6 / num_input) / 30)
+            m.weight.uniform_(-np.sqrt(6 / num_input) / omega_0, np.sqrt(6 / num_input) / omega_0)
 
 
 def first_layer_sine_init(m):

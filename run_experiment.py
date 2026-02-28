@@ -128,7 +128,8 @@ with open(os.path.join(experiment_dir, 'config_%s.txt' % current_time.strftime('
         f.write(key + ' = ' + str(val) + '\n')
 
 model = modules.SingleBVPNet(in_features=dynamics.input_dim, out_features=1, type=orig_cfg.model, mode=orig_cfg.model_mode,
-                             final_layer_factor=1., hidden_features=orig_cfg.num_nl, num_hidden_layers=orig_cfg.num_hl)
+                             final_layer_factor=1., hidden_features=orig_cfg.num_nl, num_hidden_layers=orig_cfg.num_hl,
+                             omega_0=orig_cfg.omega_0)
 model.to(cfg.device)
 
 experiment_class = getattr(experiments, orig_cfg.experiment_class)

@@ -209,6 +209,7 @@ def main():
     p.add_argument("--model_mode", choices=["mlp", "rbf", "pinn"], default="mlp")
     p.add_argument("--num_hl", type=int, default=2)
     p.add_argument("--num_nl", type=int, default=128)
+    p.add_argument("--omega_0", type=float, default=30.0)
     p.add_argument("--tc_target_mode", choices=["one_step", "n_step"], default="one_step")
     p.add_argument("--tc_n_step", type=int, default=1)
     p.add_argument("--tc_detach_next", dest="tc_detach_next", action="store_true", help="Legacy compatibility flag; ignored in observed-flow temporal mode.")
@@ -300,6 +301,7 @@ def main():
         mode=args.model_mode,
         hidden_features=args.num_nl,
         num_hidden_layers=args.num_hl,
+        omega_0=args.omega_0,
     ).to(args.device)
 
     if args.training_objective == "temporal_consistency":

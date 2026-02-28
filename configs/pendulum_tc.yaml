@@ -3,7 +3,7 @@
 
 mode: train
 experiment_name: pendulum_tc
-experiments_dir: /common/users/shared/pracsys/adaptive_roa_experiments/dhruv/deepreach/${experiment_name}
+experiments_dir: /common/users/shared/pracsys/adaptive_roa_experiments/dhruv/deepreach/${experiment_name}_500
 experiment_class: DeepReach
 dynamics_class: Pendulum
 training_objective: temporal_consistency
@@ -17,7 +17,7 @@ use_shuffled_indices_only: true
 shuffled_indices_file: train_test_splits/shuffled_indices_0.txt
 load_trajectories_in_ram: true
 trajectory_uniform_sampling: true
-max_trajectory_files: 1000
+max_trajectory_files: 500
 supervised_weight: 0.0
 
 tMin: 0.0
@@ -33,6 +33,7 @@ counter_end: 35000
 lr: 1e-4
 num_hl: 2
 num_nl: 96
+omega_0: 30.0
 model: sine
 steps_til_summary: 100
 epochs_til_ckpt: 500

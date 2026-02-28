@@ -3,7 +3,7 @@
 
 mode: train
 experiment_name: quadrotor3d_tc
-experiments_dir: /common/users/shared/pracsys/adaptive_roa_experiments/dhruv/deepreach/${experiment_name}
+experiments_dir: /common/users/shared/pracsys/adaptive_roa_experiments/dhruv/deepreach/${experiment_name}_${max_trajectory_files}_${omega_0}_${num_nl}_${num_hl}
 experiment_class: DeepReach
 dynamics_class: Quadrotor3D
 training_objective: temporal_consistency
@@ -32,7 +32,7 @@ use_shuffled_indices_only: true
 shuffled_indices_file: train_test_splits/all_shuffled_indices.txt
 load_trajectories_in_ram: true
 trajectory_uniform_sampling: true
-max_trajectory_files: 25000
+max_trajectory_files: 10000
 supervised_weight: 0.0
 
 tMin: 0.0
@@ -45,9 +45,10 @@ pretrain: false
 pretrain_iters: 0
 counter_start: 35000
 counter_end: 35000
-lr: 1e-4
-num_hl: 2
-num_nl: 96
+lr: 5e-5
+num_hl: 3
+num_nl: 256
+omega_0: 15.0
 model: sine
 steps_til_summary: 100
 epochs_til_ckpt: 5000
