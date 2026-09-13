@@ -1497,7 +1497,11 @@ class Quadrotor2D(Dynamics):
     State: [x, z, theta, x_dot, z_dot, theta_dot]. Used when dataset has 6D state
     (e.g. quadrotor2D_rl). Bounds loaded from dataset_description.json achieved_bounds
     using zero-centered max-abs-bound normalization (state_mean=0, state_var=max(|min|,|max|)).
+    Goal state loaded from dataset_description.json controller.goal_state for boundary_fn.
     """
+    # Default goal state order matching state vector layout
+    _GOAL_STATE_ORDER = ["x", "z", "theta", "x_dot", "z_dot", "theta_dot"]
+
     def __init__(
         self,
         x_bound: float = 1.0,
@@ -1533,7 +1537,24 @@ class Quadrotor2D(Dynamics):
                 zdot_bound = _max_abs_bound(achieved, "z_dot", zdot_bound)
                 thetadot_bound = _max_abs_bound(achieved, "theta_dot", thetadot_bound)
 
+        # Load goal state from dataset JSON (default: origin)
+        goal_state = [0.0] * 6
+        if isinstance(desc, dict):
+            ctrl = (desc.get("generation_parameters") or {}).get("controller") or {}
+            json_goal = ctrl.get("goal_state")
+            json_goal_order = ctrl.get("goal_state_order")
+            if isinstance(json_goal, (list, tuple)) and len(json_goal) == 6:
+                if isinstance(json_goal_order, (list, tuple)) and len(json_goal_order) == 6:
+                    # Reorder JSON goal to match our state layout
+                    json_map = {k: v for k, v in zip(json_goal_order, json_goal)}
+                    goal_state = [float(json_map.get(k, 0.0)) for k in self._GOAL_STATE_ORDER]
+                else:
+                    goal_state = [float(v) for v in json_goal]
+            if goal_state != [0.0] * 6:
+                print(f"[Quadrotor2D] Loaded goal state from dataset: {goal_state}")
+
         self.boundary_radius = boundary_radius
+        self.goal_state = goal_state
 
         super().__init__(
             loss_type='brt_hjivi', set_mode=set_mode,
@@ -1565,7 +1586,9 @@ class Quadrotor2D(Dynamics):
         raise NotImplementedError("Quadrotor2D is for temporal_consistency only; dsdt not used.")
 
     def boundary_fn(self, state):
-        scaled = state / (self.state_var.to(device=state.device) + 1e-12)
+        goal = torch.tensor(self.goal_state, dtype=state.dtype, device=state.device)
+        offset = state - goal
+        scaled = offset / (self.state_var.to(device=state.device) + 1e-12)
         return torch.sqrt(torch.sum(scaled ** 2, dim=-1) + 1e-12) - self.boundary_radius
 
     def sample_target_state(self, num_samples):
@@ -1585,7 +1608,7 @@ class Quadrotor2D(Dynamics):
 
     def plot_config(self):
         return {
-            'state_slices': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            'state_slices': list(self.goal_state),
             'state_labels': ['x', 'z', 'theta', 'x_dot', 'z_dot', 'theta_dot'],
             'x_axis_idx': 0,
             'y_axis_idx': 1,
@@ -1599,6 +1622,7 @@ class Quadrotor3D(Dynamics):
     State: [x, y, z, qw, qx, qy, qz, vx, vy, vz, wx, wy, wz]. Bounds loaded from
     dataset_description.json achieved_bounds using zero-centered max-abs-bound
     normalization (state_mean=0, state_var=max(|min|,|max|)).
+    Goal state loaded from dataset_description.json controller.goal_state for boundary_fn.
     """
     # Default 13D state order for JSON achieved_bounds / initial_state_bounds
     DEFAULT_STATE_ORDER = ["x", "y", "z", "qw", "qx", "qy", "qz",
@@ -1677,7 +1701,26 @@ class Quadrotor3D(Dynamics):
             else:
                 state_var.append(1.0)  # fallback for unknown keys
 
+        # Load goal state from dataset JSON (default: origin with qw=1)
+        goal_state = [0.0] * 13
+        goal_state[3] = 1.0  # qw=1 (identity quaternion) by default
+        if isinstance(desc, dict):
+            ctrl = (desc.get("generation_parameters") or {}).get("controller") or {}
+            json_goal = ctrl.get("goal_state")
+            json_goal_order = ctrl.get("goal_state_order")
+            if isinstance(json_goal, (list, tuple)) and len(json_goal) == 13:
+                if isinstance(json_goal_order, (list, tuple)) and len(json_goal_order) == 13:
+                    # Reorder JSON goal to match our state_order
+                    json_map = {k: v for k, v in zip(json_goal_order, json_goal)}
+                    goal_state = [float(json_map.get(k, 0.0)) for k in state_order]
+                else:
+                    goal_state = [float(v) for v in json_goal]
+            if any(v != 0.0 for v in goal_state):
+                print(f"[Quadrotor3D] Loaded goal state from dataset: {goal_state}")
+                print(f"[Quadrotor3D] State order: {state_order}")
+
         self.boundary_radius = boundary_radius
+        self.goal_state = goal_state
 
         super().__init__(
             loss_type='brt_hjivi', set_mode=set_mode,
@@ -1703,7 +1746,9 @@ class Quadrotor3D(Dynamics):
         raise NotImplementedError("Quadrotor3D is for temporal_consistency only; dsdt not used.")
 
     def boundary_fn(self, state):
-        scaled = state / (self.state_var.to(device=state.device) + 1e-12)
+        goal = torch.tensor(self.goal_state, dtype=state.dtype, device=state.device)
+        offset = state - goal
+        scaled = offset / (self.state_var.to(device=state.device) + 1e-12)
         return torch.sqrt(torch.sum(scaled ** 2, dim=-1) + 1e-12) - self.boundary_radius
 
     def sample_target_state(self, num_samples):

@@ -1,0 +1,76 @@
+# Qualitative value-function heatmap plotting config
+# ===================================================
+#
+# Usage:
+#   python scripts/plot_qualitative_value.py -c configs/plot_qualitative.yaml
+#
+# CLI overrides work on top of this file:
+#   python scripts/plot_qualitative_value.py -c configs/plot_qualitative.yaml \
+#       --recompute --device cuda:0
+#
+# Tip: copy this file, rename it, and customise per comparison.
+
+# ---------------------------------------------------------------
+# Experiments to compare (one or more trained run directories)
+# ---------------------------------------------------------------
+experiment_dirs:
+  - /common/users/shared/pracsys/adaptive_roa_experiments/dhruv/deepreach/cartpole_tc/cartpole_tc  # <-- replace with your experiment path(s)
+  # - runs/cartpole_tc_500traj
+
+# Display labels (one per experiment_dir, same order)
+labels:
+  - "CartPole TC"
+  # - "CartPole 500 traj"
+
+# ---------------------------------------------------------------
+# Evaluation settings
+# ---------------------------------------------------------------
+checkpoint: model_final.pth      # checkpoint filename under training/checkpoints
+t_eval: 10.0                     # evaluation time in seconds (null -> tMax from config)
+device: cpu                      # cpu | cuda:0 | cuda:1
+
+# ---------------------------------------------------------------
+# Slices
+# ---------------------------------------------------------------
+all_slices: true                 # plot all default slices for the system
+# slice:                         # or pick specific slices (uncomment & list):
+#   - theta_thetadot
+#   - x_xdot
+
+# Available slice names:
+#   CartPole:    theta_thetadot, x_xdot
+
+# ---------------------------------------------------------------
+# Calibrated thresholds (CartPole 1000 best)
+# ---------------------------------------------------------------
+# V <= c_low  → success, V >= c_high → failure, else → separatrix
+c_low: -0.264
+c_high: -0.194
+
+# ---------------------------------------------------------------
+# Ground truth (auto-detected from slice definitions)
+# ---------------------------------------------------------------
+# CartPole slices auto-load viz CSVs from cartpole_pybullet data dir.
+# Set no_gt: true to disable ground truth overlay.
+# no_gt: false
+
+# ---------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------
+output_dir: results/figures      # where PNGs/PDFs and caches are saved
+format:                          # output format(s) for styled images
+  - png
+  - pdf
+# vmin: -1.0                     # fixed colorbar range (null -> auto symmetric)
+# vmax:  1.0
+
+# What to generate:
+# no_bare: false                 # set true to skip bare (no-axis) images
+# no_styled: false               # set true to skip styled (with-axis) images
+# no_combined: false             # set true to skip combined multi-panel figures
+
+# ---------------------------------------------------------------
+# Performance
+# ---------------------------------------------------------------
+batch_size: 50000                # model eval batch size (lower if OOM on GPU)
+# recompute: false               # set true to ignore cached .npz and recompute
